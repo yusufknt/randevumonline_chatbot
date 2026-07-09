@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+*.md.bak
+.DS_Store
+.idea/
+.vscode/

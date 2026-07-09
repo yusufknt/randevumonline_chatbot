@@ -1,0 +1,1179 @@
+# Analytics | Developer Documentation
+
+_Source: https://developers.facebook.com/documentation/business-messaging/whatsapp/analytics_
+
+---
+
+# Analytics
+
+Updated: Apr 20, 2026
+
+Starting December 1, 2025, the maximum lookback window for messaging, conversation, and pricing analytics is changing from 10 years to 1 year. The lookback window for template and template group analytics will be unaffected and will continue to be 90 days.
+
+This document describes how to get messaging, conversation, template, and group analytics, such as the number of messages sent from a business phone number, the number of conversations and their costs for a WhatsApp Business Account (WABA), or the number of times a given template has been read.
+
+Only metrics for business phone numbers and templates associated with your WABA at the time of the request will be included in responses.
+
+## Get data
+
+Use the [WhatsApp Business Account API](https://developers.facebook.com/documentation/business-messaging/whatsapp/reference/whatsapp-business-account/whatsapp-business-account-api#get-version-waba-id) to get analytics.
+
+### Request syntax
+
+```html
+curl -g 'https://graph.facebook.com/<API_VERSION>/<WHATSAPP_BUSINESS_ACCOUNT_ID>?fields=<FIELD>.<FILTERS>' \
+-H 'Authorization: Bearer <ACCESS_TOKEN>'
+```
+
+### Request parameters
+
+| Placeholder | Description | Example Value |
+| --- | --- | --- |
+| `<FIELD>` | **Required.**<br>Metric. Value can be one of:<br>[`analytics`](https://developers.facebook.com/documentation/business-messaging/whatsapp/analytics#messaging-analytics)[`conversation_analytics`](https://developers.facebook.com/documentation/business-messaging/whatsapp/analytics#conversation-analytics)[`pricing_analytics`](https://developers.facebook.com/documentation/business-messaging/whatsapp/analytics#pricing-analytics)[`template_analytics`](https://developers.facebook.com/documentation/business-messaging/whatsapp/analytics#template-analytics)[`template_group_analytics`](https://developers.facebook.com/documentation/business-messaging/whatsapp/analytics#template-group-analytics)[`call_analytics`](https://developers.facebook.com/documentation/business-messaging/whatsapp/analytics#call-analytics)[`group_analytics`](https://developers.facebook.com/documentation/business-messaging/whatsapp/analytics#group-analytics) | `analytics` |
+| `<FILTERS>` | **Required.**<br>Metric filtering parameter. Append additional filtering parameters using dots.<br>For possible values, see:<br>[Messaging analytics parameters](https://developers.facebook.com/documentation/business-messaging/whatsapp/analytics#messaging-analytics-parameters)[Conversation analytics parameters](https://developers.facebook.com/documentation/business-messaging/whatsapp/analytics#conversation-analytics-parameters)[Template analytics parameters](https://developers.facebook.com/documentation/business-messaging/whatsapp/analytics#template-analytics-parameters)[Template group analytics parameters](https://developers.facebook.com/documentation/business-messaging/whatsapp/analytics#template-group-analytics-parameters)[Call analytics parameters](https://developers.facebook.com/documentation/business-messaging/whatsapp/analytics#call-analytics-parameters)[Group analytics parameters](https://developers.facebook.com/documentation/business-messaging/whatsapp/analytics#group-analytics-parameters) | `.start(1543543200).end(1544148000).granularity(DAY)` |
+
+## Messaging analytics
+
+The `analytics` field provides the number and type of messages sent and delivered by the phone numbers associated with a specific WABA — for conversation metrics, see [Conversation Analytics](https://developers.facebook.com/documentation/business-messaging/whatsapp/analytics#conversation-analytics). When requesting the `analytics` field, you can attach the following filtering parameters.
+
+### Messaging analytics parameters
+
+| Name | Description |
+| --- | --- |
+| `start`<br>type: UNIX Timestamp | **Required.**<br>The start date for the date range for which you are retrieving analytics. |
+| `end`<br>type: UNIX Timestamp | **Required.**<br>The end date for the date range for which you are retrieving analytics. |
+| `granularity`<br>type: String | **Required.**<br>The granularity at which you would like to retrieve the analytics. Supported Options:<br>`HALF_HOUR``DAY``MONTH` |
+| `phone_numbers`<br>type: Array | **Optional.**<br>An array of phone numbers for which you would like to retrieve analytics. If not provided, all phone numbers added to your WABA are included. |
+| `product_types`<br>type: Array | **Optional.**<br>The types of messages (notification messages and/or customer support messages) for which you want to retrieve notifications. If not provided, analytics will be returned for all messages together.<br>Supported values:<br>`0` — for template messages sent to WhatsApp users`2` — for non-templates messages sent to WhatsApp users`100` — for incoming messages sent from WhatsApp users to you |
+| `country_codes`<br>type: Array | **Optional.**<br>The countries for which you would like to retrieve analytics. Provide an array with 2 letter country codes for the countries you would like to include. If not provided, analytics will be returned for all countries you have communicated with. |
+
+### Example
+
+**Scenario:** You need to get the number of messages sent and delivered by all phone numbers associated with your WABA.
+
+**Suggested Solution:** Use following filtering parameters: `start`, `end`, `granularity`.
+
+```curl
+curl -i -X GET "https://graph.facebook.com/v25.0/102290129340398
+  ?fields=analytics
+  .start(1543543200)
+  .end(1544148000)
+  .granularity(DAY)
+  &access_token=BLI8lkj..."
+```
+
+A successful response returns an `analytics` object with the data you have requested:
+
+```json
+{
+  "analytics": {
+    "phone_numbers": [
+      "16505550111",
+      "16505550112",
+      "16505550113"
+    ],
+    "country_codes": [
+      "US",
+      "BR"
+    ],
+    "granularity": "DAY",
+    "data_points": [
+      {
+        "start": 1543543200,
+        "end": 1543629600,
+        "sent": 196093,
+        "delivered": 179715
+      },
+      {
+        "start": 1543629600,
+        "end": 1543716000,
+        "sent": 147649,
+        "delivered": 139032
+      },
+      {
+        "start": 1543716000,
+        "end": 1543802400,
+        "sent": 61988,
+        "delivered": 58830
+      },
+      {
+        "start": 1543802400,
+        "end": 1543888800,
+        "sent": 132465,
+        "delivered": 124392
+      }
+      # more data points
+    ]
+  },
+  "id": "102290129340398"
+}
+```
+
+## Conversation analytics
+
+The `conversation_analytics` field provides cost and [conversation](https://developers.facebook.com/documentation/business-messaging/whatsapp/pricing/conversation-based-pricing) information for a specific WABA. When requesting the `conversation_analytics` field, you can attach the following filtering parameters.
+
+### Conversation analytics parameters
+
+| Name | Description<br>(Click the arrow in the left column for supported options.) |
+| --- | --- |
+| `start`<br>type: UNIX Timestamp | **Required.**<br>The start date for the date range for which you are retrieving analytics. |
+| `end`<br>type: UNIX Timestamp | **Required.**<br>The end date for the date range for which you are retrieving analytics. |
+| `granularity`<br>type: String | **Required.**<br>The granularity at which you would like to retrieve the analytics. Supported Options:<br>`HALF_HOUR``DAILY``MONTHLY` |
+| `phone_numbers`<br>type: Array | **Optional.**<br>An array of phone numbers for which you would like to retrieve analytics. If not provided, all phone numbers added to your WABA are included. |
+| `metric_types` | **Optional.**<br>List of metrics you would like to receive. If you send an empty list, we return results for all metric types.<br>Supported Options: {#supported}<br>`COST`: Includes approximate charges for that time range, in the WABA’s currency.`CONVERSATION`: Includes the count of conversations for that time range.<br>**Exception:**<br>**`COST` will not be returned for WABAs that share a Solution Partner’s credit line. If your WABA shares a Solution Partner’s credit line, reach out to your Solution Partner to understand your charges.** If you a querying a WABA that shares a Solution Partner’s credit line:<br>If no `metric_types` are specified in your request, only `CONVERSATION` is returned.If only `CONVERSATION` is specified, only `CONVERSATION` is returned.If only `COST` is specified, the following exception is returned:<br> Title: “Cost not available”Message: “Cost is no longer shown for businesses who bill through a partner (i.e., BSP). To understand your charges, please reach out to your partner.”<br>If you query a time period that includes dates on or after July 1, 2023, (for example, May 1, 2023 through August 1, 2023), the response will include the above exception.<br>This does not apply if querying the `conversation_analytics` endpoint. |
+| `conversation_categories` | **Optional.**<br>List of [conversation categories](https://developers.facebook.com/documentation/business-messaging/whatsapp/pricing#conversation-categories). If you send an empty list, we return results for all conversation categories.<br>Supported Options:<br>`AUTHENTICATION``MARKETING``SERVICE``UTILITY` |
+| `conversation_types` | **Optional.**<br>List of conversation types. If you send an empty list, we return results for all conversation types. Supported Options:<br>`FREE_ENTRY`: Conversations originating from a [free entry point](https://developers.facebook.com/documentation/business-messaging/whatsapp/pricing#free-entry-point-windows).`FREE_TIER`: Conversations within the monthly [free tier](https://developers.facebook.com/documentation/business-messaging/whatsapp/pricing#free-entry-point-windows).`REGULAR`: Any conversations that did not originate from a [free entry point](https://developers.facebook.com/documentation/business-messaging/whatsapp/pricing#free-entry-point-windows) or are above the monthly free tier allotment. |
+| `conversation_directions` | **Optional.**<br>List of conversation directions. If you send an empty list, we return results for all conversation directions. Supported Options:<br>`BUSINESS_INITIATED`: Conversations initiated by the business.`USER_INITIATED`: Conversations initiated by an end user/customer.`UNKNOWN`: System cannot determine direction. |
+| `dimensions` | **Optional.**<br>List of breakdowns you would like to apply to your metrics. If you send an empty list, we return results without any breakdowns. Supported Options:<br>`CONVERSATION_CATEGORY``CONVERSATION_DIRECTION``CONVERSATION_TYPE``COUNTRY``PHONE` |
+
+Analytics data is approximate and may differ from what’s shown on invoices due to small variations in data processing.
+
+### Examples
+
+Given a time range, you can get conversation and cost information associated with your WABA. If you want, you can filter and break down your results. See the code samples below for examples.
+
+Get monthly data, using all breakdowns
+
+**Scenario:** Given a month, you want to retrieve all conversation and cost information for all phone numbers associated with a WABA.
+
+**Suggested Solution:** Use the following filtering parameters:
+
+- `start` : Start of your time range. In this case, the beginning of the month you want metrics for.
+- `end` : End of your time range. In this case, the end of the month you want metrics for.
+- `granularity` : How granular you want your data points to be. In the example below, we use `MONTHLY` , so each datapoint will represent a month’s worth of data.
+- `phone_numbers` : Send an empty array and we return information for all phone numbers associated with the WABA.
+- `dimensions` : Set it to all available breakdowns: `"CONVERSATION_CATEGORY"` , `"CONVERSATION_TYPE"` , `"COUNTRY"` , and `"PHONE"` .
+
+In this case, you do not need to specify `country_codes`, `metric_types`, `conversation_types` and `conversation_categories`. If you don’t send us anything for those fields, we return all available options. Once you set up the URL, make a GET request:
+
+```curl
+curl -i -X GET
+"https://graph.facebook.com/v25.0/102290129340398
+  ?fields=conversation_analytics
+  .start(1685602800).end(1688194800)
+  .granularity(MONTHLY)
+  .phone_numbers([])
+  .dimensions(["CONVERSATION_CATEGORY","CONVERSATION_TYPE","COUNTRY","PHONE"])
+  &access_token=BLI8lkj..."
+```
+
+A successful response returns a `conversation_analytics` object with the data you have requested. In the following example, the WABA contains only one phone number.
+
+```json
+{
+  "conversation_analytics": {
+    "data": [
+      {
+        "data_points": [
+          {
+            "start": 1685602800,
+            "end": 1688194800,
+            "conversation": 1558,
+            "phone_number": "15550458206",
+            "country": "US",
+            "conversation_type": "REGULAR",
+            "conversation_direction": "UNKNOWN",
+            "conversation_category": "AUTHENTICATION",
+            "cost": 15.58
+          },
+          {
+            "start": 1685602800,
+            "end": 1688194800,
+            "conversation": 2636,
+            "phone_number": "15550458206",
+            "country": "US",
+            "conversation_type": "REGULAR",
+            "conversation_category": "MARKETING",
+            "cost": 26.36
+          },
+          {
+            "start": 1685602800,
+            "end": 1688194800,
+            "conversation": 2238,
+            "phone_number": "15550458206",
+            "country": "US",
+            "conversation_type": "REGULAR",
+            "conversation_category": "SERVICE",
+            "cost": 22.38
+          },
+          {
+            "start": 1685602800,
+            "end": 1688194800,
+            "conversation": 1782,
+            "phone_number": "15550458206",
+            "country": "US",
+            "conversation_type": "REGULAR",
+            "conversation_category": "UTILITY",
+            "cost": 17.82
+          },
+          {
+            "start": 1685602800,
+            "end": 1688194800,
+            "conversation": 1568,
+            "phone_number": "15550458206",
+            "country": "US",
+            "conversation_type": "FREE_TIER",
+            "conversation_category": "AUTHENTICATION",
+            "cost": 15.68
+          },
+          {
+            "start": 1685602800,
+            "end": 1688194800,
+            "conversation": 2716,
+            "phone_number": "15550458206",
+            "country": "US",
+            "conversation_type": "FREE_TIER",
+            "conversation_category": "MARKETING",
+            "cost": 27.16
+          },
+          {
+            "start": 1685602800,
+            "end": 1688194800,
+            "conversation": 2180,
+            "phone_number": "15550458206",
+            "country": "US",
+            "conversation_type": "FREE_TIER",
+            "conversation_category": "SERVICE",
+            "cost": 21.8
+          },
+          {
+            "start": 1685602800,
+            "end": 1688194800,
+            "conversation": 1465,
+            "phone_number": "15550458206",
+            "country": "US",
+            "conversation_type": "FREE_TIER",
+            "conversation_category": "UTILITY",
+            "cost": 14.65
+          },
+          {
+            "start": 1685602800,
+            "end": 1688194800,
+            "conversation": 1433,
+            "phone_number": "15550458206",
+            "country": "US",
+            "conversation_type": "FREE_ENTRY_POINT",
+            "conversation_category": "SERVICE",
+            "cost": 14.33
+          }
+        ]
+      }
+    ]
+  },
+  "id": "102290129340398"
+}
+```
+
+Get data for a specific phone number, using all breakdowns and half hour granularity
+
+**Scenario**: Given a time range, you want to retrieve all conversation and cost information for a specific phone number associated with a WABA. In the results, you want to use all possible breakdowns. You need each data point to represent half an hour’s worth of data.
+
+**Suggested Solution**: Use the following filtering parameters:
+
+- `start` : Start of your time range.
+- `end` : End of your time range.
+- `granularity` : How granular you want your data points to be. In the example below, we use `HALF_HOUR` , so each datapoint represents half an hour’s worth of data.
+- `phone_numbers` : The phone number you need information for.
+- `dimensions` : Set it to all available breakdowns: `CONVERSATION_CATEGORY` , `CONVERSATION_TYPE` , `COUNTRY` , and `PHONE` .
+
+In this case, you do not need to specify `country_codes`, `metric_types`, `conversation_types`, or `conversation_categories`. If you don’t send us anything for those fields, we return all available options. Once you set up the URL, make a GET request:
+
+```curl
+curl -i -X GET \
+"https://graph.facebook.com/v25.0/102290129340398
+  ?fields=conversation_analytics
+  .start(1685602800)
+  .end(1685689200)
+  .granularity(HALF_HOUR)
+  .phone_numbers(["19195552584"])
+  .dimensions(["CONVERSATION_CATEGORY","CONVERSATION_TYPE","COUNTRY,PHONE"])
+  &access_token=BLI8lkj..."
+```
+
+A successful response returns a `conversation_analytics` object with the data you have requested:
+
+```json
+{
+  "conversation_analytics": {
+    "data": [
+      {
+        "data_points": [
+          {
+            "start": 1685602800,
+            "end": 1685604600,
+            "conversation": 4,
+            "phone_number": "19195552584",
+            "country": "US",
+            "conversation_type": "REGULAR",
+            "conversation_direction": "UNKNOWN",
+            "conversation_category": "SERVICE",
+            "cost": 0.0232
+          },
+          {
+            "start": 1685602800,
+            "end": 1685604600,
+            "conversation": 4,
+            "phone_number": "19195552584",
+            "country": "US",
+            "conversation_type": "REGULAR",
+            "conversation_direction": "UNKNOWN",
+            "conversation_category": "MARKETING",
+            "cost": 0.0232
+          },
+         # ... more data points
+        ]
+      }
+    ]
+  },
+  "id": "102290129340398"
+}
+```
+
+Get monthly data, using conversation type breakdowns
+
+**Scenario**: Given a time range, you want to retrieve all conversation and cost information for all phone numbers associated with a WABA. In the results, you want to break down by conversation type.
+
+**Suggested Solution**: Use the following filtering parameters:
+
+- `start` : Start of your time range.
+- `end` : End of your time range.
+- `granularity` : How granular you want your data points to be. In the example below, we use `MONTHLY` , so each datapoint represents half a month’s worth of data.
+- `phone_numbers` : Send an empty array and we’ll return information for all phone numbers associated with the WABA.
+- `dimensions` : Set it to `CONVERSATION_TYPE` .
+
+In this case, you do not need to specify `country_codes`, `metric_types`, `conversation_types`, `conversation_directions`, or `conversation_categories`. If you don’t send us anything for those fields, we return all available options. Once you set up the URL, make a GET request:
+
+```curl
+curl -i -X GET "https://graph.facebook.com/v25.0/102290129340398
+      ?fields=conversation_analytics
+      .start(1643702400).end(1646121600)
+      .granularity(MONTHLY)
+      .phone_numbers([])
+      .dimensions([CONVERSATION_TYPE])
+      &access_token=BLI8lkj..."
+```
+
+A successful response returns a `conversation_analytics` object with the data you have requested:
+
+```json
+{
+  "data": [
+    {
+      "data_points": [
+        {
+          "start": 1643702400,
+          "end": 1646121600,
+          "conversation": 8500,
+          "conversation_type": "REGULAR",
+          "cost": 88.1010
+        },
+        {
+          "start": 1643702400,
+          "end": 1646121600,
+          "conversation": 1000,
+          "conversation_type": "FREE_TIER",
+          "cost": 0.0000
+        },
+        {
+          "start": 1643702400,
+          "end": 1646121600,
+          "conversation": 250,
+          "conversation_type": "FREE_ENTRY_POINT",
+          "cost": 0.0000
+        }
+      ]
+    }
+  ]
+}
+```
+
+Get half-hour data broken down by conversation category
+
+Request:
+
+```curl
+curl -i -X GET "https://graph.facebook.com/v25.0/102290129340398
+  ?fields=conversation_analytics
+  .start(1685527200)
+  .end(1685613600)
+  .granularity(HALF_HOUR)
+  .conversation_categories(["MARKETING","AUTHENTICATION"])
+  .dimensions(["CONVERSATION_CATEGORY"])
+  &access_token=BLI8lkj..."
+```
+
+Response:
+
+```json
+{
+  "conversation_analytics": {
+    "data": [
+      {
+        "data_points": [
+          {
+            "start": 1685529000,
+            "end": 1685530800,
+            "conversation": 2,
+            "conversation_category": "AUTHENTICATION",
+            "cost": 0.0128
+          },
+          {
+            "start": 1685527200,
+            "end": 1685529000,
+            "conversation": 3,
+            "conversation_category": "MARKETING",
+            "cost": 0.0432
+          }
+        ]
+      }
+    ]
+  },
+  "id": "102290129340398"
+}
+```
+
+Get half-hour data broken down by conversation category and conversation type
+
+Request:
+
+```curl
+curl -i -X GET \
+ "https://graph.facebook.com/v25.0/102290129340398
+  ?fields=conversation_analytics
+  .start(1685527200)
+  .end(1685613600)
+  .granularity(HALF_HOUR)
+  .conversation_categories(["MARKETING","AUTHENTICATION"])
+  .dimensions(["CONVERSATION_CATEGORY","CONVERSATION_TYPE"])
+  &access_token=BLI8lkj..."
+```
+
+Response:
+
+```json
+{
+  "conversation_analytics": {
+    "data": [
+      {
+        "data_points": [
+          {
+            "start": 1685527200,
+            "end": 1685529000,
+            "conversation": 3,
+            "conversation_type": "REGULAR",
+            "conversation_category": "MARKETING",
+            "cost": 0.0432
+          },
+          {
+            "start": 1685529000,
+            "end": 1685530800,
+            "conversation": 2,
+            "conversation_type": "REGULAR",
+            "conversation_category": "AUTHENTICATION",
+            "cost": 0.0128
+          }
+        ]
+      }
+    ]
+  },
+  "id": "102290129340398"
+}
+```
+
+## Pricing analytics
+
+The `pricing_analytics` field allows you to get pricing breakdowns for any messages delivered within a specified date range.
+
+### Request syntax
+
+```html
+GET /<WHATSAPP_BUSINESS_ACCOUNT_ID>
+  ?fields=pricing_analytics
+  .start(<START>)
+  .end(<END>)
+  .granularity(<GRANULARITY>)
+  .phone_numbers(<PHONE_NUMBERS>)
+  .country_codes(<COUNTRY_CODES>)
+  .metric_types(<METRIC_TYPES>)
+  .pricing_types(<PRICING_TYPES>)
+  .pricing_categories(<PRICING_CATEGORIES>)
+  .dimensions(<DIMENSIONS>)
+```
+
+### Pricing analytics parameters
+
+| Filter | Description | Example Value |
+| --- | --- | --- |
+| `<COUNTRY_CODES>`<br>*Array of strings* | **Optional.**<br>The countries for which you would like to retrieve analytics. Provide an array with 2 letter country codes for the countries you would like to include. If not provided, analytics will be returned for all countries you have communicated with. | `[<br>US,<br>BR<br>]` |
+| `<DIMENSIONS>`<br>*Array of strings* | **Optional.**<br>List of breakdowns you would like to apply to your metrics. If you send an empty list, we return results without any breakdowns.<br>Values can be:<br>`COUNTRY``PHONE``PRICING_CATEGORY``PRICING_TYPE``TIER` | `[<br>PRICING_CATEGORY,<br>PRICING_TYPE,<br>COUNTRY<br>]` |
+| `<END>`<br>*UNIX timestamp* | **Required.**<br>UNIX timestamp indicating the end date for the date range you are retrieving analytics for. | `1728581152` |
+| `<GRANULARITY>`<br>*String* | **Required.**<br>The granularity at which you would like to retrieve the analytics. Value can be one of:<br>`DAILY``HALF_HOUR``MONTHLY` | `DAILY` |
+| `<METRIC_TYPES>`<br>*Array of strings* | **Optional.**<br>Array of metrics you would like to receive. If you send an empty array, we return results for all metric types.<br>Values can be:<br>`COST`: Approximate charges for messages delivered in that time range, in your WABA’s currency.`VOLUME`: Includes the number of messages delivered for that time range.<br>**Note that `COST` will not be returned for WABAs that share a Solution Partner’s credit line. If your WABA shares a Solution Partner’s credit line, reach out to your Solution Partner to understand your charges.** | `[COST, VOLUME]` |
+| `<PHONE_NUMBERS>`<br>*Array of strings* | **Optional.**<br>An array of phone numbers for which you would like to retrieve analytics. If not provided, data for all business phone numbers associated with your WABA are included. | `[<br>15550783881,<br>15550783882,<br>15550783883<br>]` |
+| `<PRICING_CATEGORIES>`<br>*Array of strings* | **Optional.**<br>Array of pricing categories. If you send an empty array, we return results for all pricing categories.<br>Values can be:<br>`AUTHENTICATION`: Messages charged the authentication rate.`AUTHENTICATION_INTERNATIONAL`: Messages charged the authentication-international rate.`MARKETING`: Messages charged the marketing rate.`SERVICE`: Messages that were not charged. Includes all non-template messages and utility messages sent inside of a customer service window.`UTILITY`: Messages charged the utility rate.`REFERRAL_CONVERSION`: Messages that have been received through a [free entry point](https://developers.facebook.com/documentation/business-messaging/whatsapp/pricing#free-entry-point-windows) | `[<br>AUTHENTICATION,<br>MARKETING,<br>UTILITY<br>]` |
+| `<PRICING_TYPES>`<br>*Array of strings* | **Optional.**<br>Array of pricing types. If you send an empty array, we return results for all pricing types.<br>Values can be:<br>`FREE_CUSTOMER_SERVICE`: Free messages. These are non-template messages and utility messages sent within customer service windows.`FREE_ENTRY_POINT`: All messages sent within free entry point customer service windows.`REGULAR`: Billable messages. Includes all authentication and marketing template messages, and any utility template messages sent outside of a customer service window. Excludes all messages sent within free entry point customer service windows. | `[<br>REGULAR,<br>FREE_CUSTOMER_SERVICE<br>]` |
+| `<START>`<br>*UNIX timestamp* | **Required.**<br>UNIX timestamp indicating the start date for the date range you are retrieving analytics for. | `1726014453` |
+| `<WABA_ID>`<br>*String* | **Required.**<br>WhatsApp Business Account ID. | `102290129340398` |
+
+### Volume tier information
+
+Include the `TIER`, `PRICING_CATEGORY`, and `COUNTRY` parameters in the `dimensions` array to get volume tier information. Data points representing messages affected by volume tier pricing will have a `tier` property in the response.
+
+Example response syntax with tier information
+
+```html
+{
+  "start": <START_TIMESTAMP>,
+  "end": <END_TIMESTAMP>,
+  "phone_number": "<BUSINESS_PHONE_NUMBER>",
+  "country": "<COUNTRY_CODE>",
+  "tier": "<LOWER>:<UPPER>",
+  "pricing_type": "<PRICING_TYPE>",
+  "pricing_category": "<PRICING_CATEGORY>",
+  "volume": <VOLUME>,
+  "cost": <COST>
+}
+```
+
+The `tier` property value represents a concatenation of the lower and upper bounds for the tier specific to the market–category pair (`country` and `pricing_category`) that that data point represents.
+
+- `<LOWER>` – An integer representing the lower bound of the tier (inclusive).
+- `<UPPER>` – An integer representing the upper bound of the tier (inclusive), or the string `MAX` .
+
+**Notes**
+
+- To determine your current volume tier, read the `tier` , `country` , and `pricing_category` values. The `tier` value’s `<UPPER>` integer (the integer after the colon) tells you your current tier for the `country` and `pricing_category` (for example, (India and utility, respectively).
+- To determine how many messages you need to send to reach the next tier for a given `country` and `pricing_category` , subtract the `volume` integer from the tier value’s `<UPPER>` integer.
+- Volume tiers will only be available for utility and authentication template messages. For marketing template messages (where volume tiers will not apply), tier will be set to `0:MAX` .
+- The `tier` property will be omitted for data points that represent free messages, since free messages don’t contribute to tiering counts.
+- Volume tiers will be determined solely by Meta. All insights data is approximate due to small variations in data processing. Undue reliance should not be placed on insights data.
+
+### Example request
+
+```curl
+curl 'https://graph.facebook.com/v25.0/161311403722088?fields=pricing_analytics.start(1748761200).end(1749687703).granularity(DAILY).dimensions(PRICING_CATEGORY,PRICING_TYPE,TIER,COUNTRY).country_codes(US,IN)' \
+-H 'Authorization: Bearer EAAJB'
+```
+
+### Example response
+
+```json
+{
+  "pricing_analytics": {
+    "data": [
+      {
+        "data_points": [
+          {
+            "start": 1749193200,
+            "end": 1749279600,
+            "country": "IN",
+            "pricing_type": "FREE_CUSTOMER_SERVICE",
+            "pricing_category": "SERVICE",
+            "volume": 2,
+            "cost": 0
+          },
+          {
+            "start": 1749106800,
+            "end": 1749193200,
+            "country": "IN",
+            "tier": "0:750000",
+            "pricing_type": "REGULAR",
+            "pricing_category": "AUTHENTICATION_INTERNATIONAL",
+            "volume": 2,
+            "cost": 4.6
+          },
+          {
+            "start": 1749106800,
+            "end": 1749193200,
+            "country": "IN",
+            "pricing_type": "FREE_CUSTOMER_SERVICE",
+            "pricing_category": "SERVICE",
+            "volume": 2,
+            "cost": 0
+          },
+          {
+            "start": 1748934000,
+            "end": 1749020400,
+            "country": "US",
+            "tier": "0:MAX",
+            "pricing_type": "REGULAR",
+            "pricing_category": "MARKETING",
+            "volume": 1,
+            "cost": 10
+          },
+          {
+            "start": 1748847600,
+            "end": 1748934000,
+            "country": "US",
+            "pricing_type": "FREE_CUSTOMER_SERVICE",
+            "pricing_category": "SERVICE",
+            "volume": 1,
+            "cost": 0
+          },
+          {
+            "start": 1748847600,
+            "end": 1748934000,
+            "country": "US",
+            "pricing_type": "FREE_ENTRY_POINT",
+            "pricing_category": "SERVICE",
+            "volume": 6,
+            "cost": 0
+          },
+          {
+            "start": 1748847600,
+            "end": 1748934000,
+            "country": "US",
+            "tier": "0:2",
+            "pricing_type": "REGULAR",
+            "pricing_category": "AUTHENTICATION",
+            "volume": 1,
+            "cost": 10
+          },
+          {
+            "start": 1748847600,
+            "end": 1748934000,
+            "country": "IN",
+            "tier": "0:750000",
+            "pricing_type": "REGULAR",
+            "pricing_category": "AUTHENTICATION_INTERNATIONAL",
+            "volume": 1,
+            "cost": 2.3
+          },
+          {
+            "start": 1748761200,
+            "end": 1748847600,
+            "country": "US",
+            "pricing_type": "FREE_CUSTOMER_SERVICE",
+            "pricing_category": "SERVICE",
+            "volume": 2,
+            "cost": 0
+          },
+          {
+            "start": 1748761200,
+            "end": 1748847600,
+            "country": "US",
+            "tier": "0:2",
+            "pricing_type": "REGULAR",
+            "pricing_category": "AUTHENTICATION",
+            "volume": 1,
+            "cost": 10
+          },
+          {
+            "start": 1748761200,
+            "end": 1748847600,
+            "country": "US",
+            "pricing_type": "FREE_CUSTOMER_SERVICE",
+            "pricing_category": "UTILITY",
+            "volume": 1,
+            "cost": 0
+          },
+          {
+            "start": 1748761200,
+            "end": 1748847600,
+            "country": "US",
+            "tier": "0:2",
+            "pricing_type": "REGULAR",
+            "pricing_category": "UTILITY",
+            "volume": 1,
+            "cost": 10
+          },
+          {
+            "start": 1748761200,
+            "end": 1748847600,
+            "country": "US",
+            "tier": "0:MAX",
+            "pricing_type": "REGULAR",
+            "pricing_category": "MARKETING",
+            "volume": 4,
+            "cost": 40
+          },
+          {
+            "start": 1748761200,
+            "end": 1748847600,
+            "country": "US",
+            "tier": "0:MAX",
+            "pricing_type": "REGULAR",
+            "pricing_category": "MARKETING_LITE",
+            "volume": 1,
+            "cost": 10
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+## Template analytics
+
+Template analytics describe the number of times a template has been sent, delivered, and read, and the number of times [URL buttons](https://developers.facebook.com/documentation/business-messaging/whatsapp/templates/components#url-buttons) or [Quick Reply buttons](https://developers.facebook.com/documentation/business-messaging/whatsapp/templates/components#quick-reply-buttons) in the template have been clicked. Additionally, onboarded [MM API for WhatsApp](https://developers.facebook.com/documentation/business-messaging/whatsapp/marketing-messages/overview) businesses can track offsite conversion metrics.
+
+Data is returned with a daily granularity in the default timezone of UTC and WABA’s timezone, with a lookback window of up to 90 days. To show data in the WABA’s configured timezone, pass in the use_waba_timezone param with a value of true.
+
+Display data in the WABA’s configured timezone by passing in the `use_waba_timezone` param with a value of `true`.
+
+```json
+{
+ "data": [
+   {
+     "waba_timezone": "America/Los_Angeles",
+     "granularity": "DAILY",
+     "product_type": "cloud_api",
+     "data_points": [
+         ...
+     ]
+   }
+}
+```
+
+### Limitations
+
+- Button click analytics are only available for templates categorized as `MARKETING` or `UTILITY` .
+- WABAs owned by or shared with Meta Business Accounts in the European Union, United Kingdom, or Japan, or that have a business phone number with a country calling code from any of those countries or regions, are not supported.
+- Offsite conversion metrics are available exclusively for businesses onboarded to MM API for WhatsApp.
+- Read and click event data for WhatsApp template messages is only available for up to 7 days from the date the message is sent. After this 7-day window, the corresponding read/click counts reset to zero and no further updates are recorded for those messages.
+
+### Confirming template analytics
+
+You must confirm template analytics on your WhatsApp Business Account before you can get template analytics. You can confirm template analytics using the WhatsApp Manager or the API.
+
+By confirming access via the API, you direct Meta to add insights to your WhatsApp Business Account. These insights include link tracking to report website clicks. You can turn off link tracking on each message template. You also direct Meta to collect and anonymize data from your chats with customers. Meta will anonymize this data to improve services it provides you and other businesses.
+
+To confirm via API, send the following request:
+
+```html
+POST /<WHATSAPP_BUSINESS_ACCOUNT_ID>?is_enabled_for_insights=true
+```
+
+Once confirmed, we will begin capturing template analytics for the WhatsApp Business Account. Once confirmed, template analytics cannot be disabled.
+
+Upon success, the API will respond with your WhatsApp Business Account ID. For example:
+
+```json
+{
+  "id": 102290129340398
+}
+```
+
+### Template analytics parameters
+
+| Name | Description | Example Value |
+| --- | --- | --- |
+| `start`<br>*UNIX Timestamp or date string* | **Required.**<br>The start time for the date range you are retrieving analytics for. Can be represented as either a unix timestamp integer or a date string in the format YYYY-MM-DD.<br>As template analytics are being provided with a daily granularity in the UTC timezone, a start unix timestamp that does not correspond to 0:00 UTC will be adjusted back to the current day’s 00:00 UTC.<br>If `use_waba_timezone` param has a value of true, this value must be a date string in the format YYYY-MM-DD. | `1543536000` |
+| `end`<br>*UNIX Timestamp or date string* | **Required.**<br>The end time for the date range you are retrieving analytics for. Can be represented as either a unix timestamp integer or a date string in the format YYYY-MM-DD. As template analytics are being provided with a daily granularity in the UTC timezone, an end unix timestamp that does not correspond to 0:00 UTC will be adjusted back to the current day’s 00:00 UTC.<br>If `use_waba_timezone` param has a value of true, this value must be a date string in the format YYYY-MM-DD. | `1543708800` |
+| `granularity`<br>*Enum* | **Required.**<br>The granularity at which you would like to retrieve the analytics. Value must be `DAILY`. | `DAILY` |
+| `template_ids`<br>*Array of IDs* | **Required.**<br>An array of template IDs for which you would like to retrieve analytics for.<br>Maximum 10. | `[1924084211297547,954638012257287,969725530748535]` |
+| `metric_types`<br>*Array of enums* | **Optional.**<br>The types of metrics which you want to retrieve. If omitted or an empty array, analytics for all metric types will be returned.<br>Possible values:<br>`COST``CLICKED``DELIVERED``READ``SENT``APP_ACTIVATIONS (MM API for WhatsApp only)``APP_ADD_TO_CART (MM API for WhatsApp only)``APP_CHECKOUTS_INITIATED (MM API for WhatsApp only)``APP_PURCHASES (MM API for WhatsApp only)``APP_PURCHASES_CONVERSION_VALUE (MM API for WhatsApp only)``WEBSITE_ADD_TO_CART (MM API for WhatsApp only)``WEBSITE_CHECKOUTS_INITIATED (MM API for WhatsApp only)``WEBSITE_PURCHASES (MM API for WhatsApp only)``WEBSITE_PURCHASES_CONVERSION_VALUE (MM API for WhatsApp only)`<br>`APP_ADD_PAYMENT_INFO (MM API for WhatsApp only)``APP_ADD_TO_WISHLIST (MM API for WhatsApp only)``APP_COMPLETE_REGISTRATION (MM API for WhatsApp only)``APP_LEVEL_ACHIEVED (MM API for WhatsApp only)``APP_OTHER (MM API for WhatsApp only)``APP_RATE (MM API for WhatsApp only)``APP_SEARCH (MM API for WhatsApp only)``APP_TUTORIAL_COMPLETION (MM API for WhatsApp only)``APP_VIEW_CONTENT (MM API for WhatsApp only)``WEBSITE_ADD_PAYMENT_INFO (MM API for WhatsApp only)``WEBSITE_ADD_TO_WISHLIST (MM API for WhatsApp only)``WEBSITE_COMPLETE_REGISTRATION (MM API for WhatsApp only)``WEBSITE_CUSTOM (MM API for WhatsApp only)``WEBSITE_LEAD (MM API for WhatsApp only)``WEBSITE_SEARCH (MM API for WhatsApp only)``WEBSITE_VIEW_CONTENT (MM API for WhatsApp only)`<br>You can [learn more about cost and click metrics here.](https://developers.facebook.com/documentation/business-messaging/whatsapp/analytics#template-analytics-cost-and-click-metrics).<br>**Note that `COST` will not be returned for WABAs that share a Solution Partner’s credit line. If your WABA shares a Solution Partner’s credit line, reach out to your Solution Partner to understand your charges.** | `[SENT,DELIVERED,READ]` |
+| `product_type`<br>*Enum* | **Optional.**<br>The product type of the metrics you want to retrieve. If omitted, only analytics for Cloud API will be returned.<br>Possible values:<br>`CLOUD_API`: Use this product type to filter for template metrics sent via Cloud API`MARKETING_MESSAGES_API_FOR_WHATSAPP`: Use this product type to filter for template metrics sent via Marketing Messages API for WhatsApp | `MARKETING_MESSAGES_API_FOR_WHATSAPP` |
+| `<USE_WABA_TIMEZONE>`<br>*Boolean* | **Optional.**<br>Whether to show metrics in the WABA’s configured timezone. If false or omitted, metrics will be shown in UTC.<br>If true, params start and end must be in the format YYYY-MM-DD. | `true` |
+
+### Examples
+
+Getting all template analytics
+
+**Scenario:** Given a 1-day timeframe, get all template analytics metric types for an authentication template and a marketing template with a URL button.
+
+Example Request:
+
+```curl
+curl -g 'https://graph.facebook.com/v25.0/109259195336416/template_analytics?start=1718064000&end=1718122745&granularity=daily&metric_types=cost%2Cclicked%2Cdelivered%2Cread%2Csent&template_ids=[1421988012088524%2C2632273056924580]' \
+-H 'Authorization: Bearer EAAJB...'
+```
+
+Example response:
+
+```json
+{
+  "data": [
+    {
+      "granularity": "DAILY",
+      "product_type": "cloud_api", // Only available to businesses in the Marketing Messages API for WhatsApp alpha
+      "data_points": [
+        {
+          "template_id": "1421988012088524",
+          "start": 1718064000,
+          "end": 1718150400,
+          "sent": 1,
+          "delivered": 1,
+          "read": 1,
+          "cost": [
+            {
+              "type": "amount_spent",
+              "value": 0.01
+            },
+            {
+              "type": "cost_per_delivered",
+              "value": 0.01
+            }
+          ]
+        },
+        {
+          "template_id": "2632273056924580",
+          "start": 1718064000,
+          "end": 1718150400,
+          "sent": 1,
+          "delivered": 1,
+          "read": 1,
+          "clicked": [
+            {
+              "type": "quick_reply_button",
+              "button_content": "Contact Support",
+              "count": 108
+            },
+            {
+              "type": "unique_url_button",
+              "button_content": "Tell me more",
+              "count": 16
+            }
+          ],
+          "cost": [
+            {
+              "type": "amount_spent",
+              "value": 0.03
+            },
+            {
+              "type": "cost_per_delivered",
+              "value": 0.03
+            },
+            {
+              "type": "cost_per_url_button_click",
+              "value": 0.03
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "paging": {
+    "cursors": {
+      "before": "MAZDZD",
+      "after": "MjQZD"
+    }
+  }
+}
+```
+
+### Template analytics cost and click metrics
+
+**Cost metrics** are returned as an array of cost objects, each with a type and value. Types can be:
+
+- `amount_spent` — Total amount spent on conversations opened within the `start` and `end` timeframe as a result of sending the template. See [Opening Conversations](https://developers.facebook.com/documentation/business-messaging/whatsapp/pricing#opening-conversations) .
+- `cost_per_delivered` — The `amount_spent` value divided by the number of times the template was delivered within the `start` and `end` timeframe.
+- `cost_per_url_button_click` — The `amount_spent` value divided by the number of times the template’s URL button was clicked, within the `start` and `end` timeframe. Quick reply button clicks are not included. Object omitted if the template does not have a URL button.
+
+**Click metrics** are returned as an array of JSON objects each with a type and value. Clicks are only returned for URL buttons and quick-reply buttons in templates categorized as `MARKETING` or `UTILITY`.
+
+Types can be:
+
+- `url_button` — The total number of clicks on the url button.
+- `unique_url_button` — Unique clicks track the number of distinct WhatsApp accounts that have clicked on a button. This metric helps you understand how many individual users are engaging with your CTAs, while eliminating duplicate clicks from the same recipient and providing an accurate measurement of engagement.
+
+### Disabling button click analytics
+
+You can disable button click tracking on an individual template by setting its `cta_url_link_tracking_opted_out` field to `true`. Once disabled, the API will no longer return the clicked property in template analytics or display button engagement/clicks in the WhatsApp Manager when viewing the template’s insights.
+
+Request syntax
+
+```html
+POST /<TEMPLATE_ID>
+  ?cta_url_link_tracking_opted_out=<OPT_OUT>
+  &category=<TEMPLATE_CATEGORY>
+```
+
+Request parameters
+
+| Placeholder | Description | Example Value |
+| --- | --- | --- |
+| `<WHATSAPP_TEMPLATE_ID>`<br>*Template ID* | **Required.**<br>Template ID. | `245435364965041` |
+| `<OPT_OUT>`<br>*Boolean* | **Required.**<br>Indicates if template button click tracking is disabled. Set to `true` to disable button click tracking on the template, or `false` to enable.<br>This value is set to `false` upon template creation. | `true` |
+| `<TEMPLATE_CATEGORY>`<br>*String* | **Required.**<br>Template’s current category.<br>If you set the template category to a value other than its current category, the template status will be set to `PENDING` and the template must undergo template review to be approved. | `marketing` |
+
+Example request
+
+```curl
+curl -X POST 'https://graph.facebook.com/v25.0/245435364965041?cta_url_link_tracking_opted_out=true&category=marketing' \
+-H 'Authorization: Bearer EAAJB...'
+```
+
+Example response
+
+Upon success, the API will respond with:
+
+```json
+{
+    "success": true
+}
+```
+
+## Template group analytics
+
+The `template_group_analytics` field allows you to get the number of times templates within a [template group](https://developers.facebook.com/documentation/business-messaging/whatsapp/templates/template-groups) have been sent, delivered, and read, and the number of times their [URL buttons](https://developers.facebook.com/documentation/business-messaging/whatsapp/templates/components#url-buttons) or [Quick Reply buttons](https://developers.facebook.com/documentation/business-messaging/whatsapp/templates/components#quick-reply-buttons) have been clicked.
+
+Data is returned with a daily granularity in the default timezone of UTC and WABA’s timezone, with a lookback window of up to 90 days. To show data in the WABA’s configured timezone, pass in the use_waba_timezone param with a value of true.
+
+```json
+{
+ "data": [
+   {
+     "waba_timezone": "America/Los_Angeles",
+     "granularity": "DAILY",
+     "product_type": "cloud_api",
+     "data_points": [
+         ...
+     ]
+   }
+}
+```
+
+### Limitations
+
+Button click analytics are only available for templates categorized as `marketing` or `utility`.
+WABAs owned by or shared with Meta Business Accounts in the European Union, United Kingdom, or Japan, or that have a business phone number with a country calling code from any of those countries or regions, are not supported.
+
+### Enabling template analytics
+
+You must enable template analytics on your WhatsApp Business Account before you can get template group analytics. You can confirm template analytics enablement using the WhatsApp Manager or the API.
+
+By confirming access via the API, you direct Meta to add insights to your WhatsApp Business Account. These insights include link tracking to report website clicks. You can turn off link tracking on each message template. You also direct Meta to collect and anonymize data from your chats with customers. Meta will anonymize this data to improve services it provides you and other businesses.
+
+To confirm enablement via API, send the following request:
+
+`POST /<WHATSAPP_BUSINESS_ACCOUNT_ID>?is_enabled_for_insights=true`
+
+Upon success, the API will respond with your WhatsApp Business Account ID and we will begin capturing template group analytics for the WhatsApp Business Account.
+
+Once enabled, template analytics cannot be disabled.
+
+### Request syntax
+
+```html
+GET /<WHATSAPP_BUSINESS_ACCOUNT_ID>/template_group_analytics
+  ?granularity=daily
+  &start=<START_TIME>
+  &end=<END_TIME>
+  &metric_types=<METRIC_TYPES>
+  &template_group_ids=[<TEMPLATE_GROUP_IDS>]
+```
+
+### Template group analytics parameters
+
+| Placeholder | Description | Example value |
+| --- | --- | --- |
+| `<WABA_ID>`*String* | **Required.**<br>WhatsApp Business Account ID. | `102290129340398` |
+| `<START_TIME>`<br>*UNIX Timestamp or date string* | **Required.**<br>The start time for the date range you are retrieving analytics for. Can be represented as either a unix timestamp integer or a date string in the format YYYY-MM-DD.<br>As template group analytics are being provided with a daily granularity in the UTC timezone, a start unix timestamp that does not correspond to 0:00 UTC will be adjusted back to the current day’s 00:00 UTC.<br>If `use_waba_timezone` param has a value of true, this value must be a date string in the format YYYY-MM-DD. | `1738465116` |
+| `<END_TIME>`<br>*UNIX Timestamp or date string* | **Required.**<br>The end time for the date range you are retrieving analytics for. Can be represented as either a unix timestamp integer or a date string in the format YYYY-MM-DD.<br>As template group analytics are being provided with a daily granularity in the UTC timezone, an end unix timestamp that does not correspond to 0:00 UTC will be adjusted back to the current day’s 00:00 UTC.<br>If `use_waba_timezone param` has a value of true, this value must be a date string in the format YYYY-MM-DD. | `1739559516` |
+| `<METRIC_TYPES>`<br>*Array of strings* | **Optional.**<br>Array of metrics you would like to receive. If you send an empty array, the API returns results for all metric types.<br>Values can be:<br>`cost``clicked``delivered``read``sent`<br>Note that `COST` is not accessible to business customers who are billed through a Solution Partner.<br>See [Cost and click metrics](https://developers.facebook.com/documentation/business-messaging/whatsapp/analytics#template-group-cost-and-click-metrics) to learn more about cost and click metrics. | `[<br> sent,<br> delivered,<br> read<br>]` |
+| `<TEMPLATE_GROUP_IDS>` | **Required.**<br>An array of template group IDs for which you wish to get template group metrics.<br>Maximum 10 IDs. | `102290129340398` |
+| `<USE_WABA_TIMEZONE`>`<br>*Boolean* | **Optional.**<br>Whether to show metrics in the WABA’s configured timezone. If false or omitted, metrics will be shown in UTC.<br>If true, params start and end must be in the format YYYY-MM-DD. | `true` |
+
+### Example request
+
+```curl
+curl -g 'https://graph.facebook.com/v25.0/102290129340398/template_group_analytics?granularity=daily&start=1738465116&end=1739559516&metric_types=sent,delivered,read&template_group_ids=[1044106240855852]' \
+-H 'Authorization: Bearer EAAJB...'
+```
+
+### Example response
+
+Note that the example below has been truncated with an ellipsis (`...`) for brevity.
+
+```json
+{
+  "data": [
+    {
+      "granularity": "DAILY",
+      "data_points": [
+        {
+          "template_group_id": "1044106240855852",
+          "start": 1739491200,
+          "end": 1739577600,
+          "sent": 1460,
+          "delivered": 1460,
+          "read": 1399
+        },
+        {
+          "template_group_id": "1044106240855852",
+          "start": 1739404800,
+          "end": 1739491200,
+          "sent": 673,
+          "delivered": 673,
+          "read": 645
+        }
+        ...
+      ]
+    }
+  ],
+  "paging": {
+    "cursors": {
+      "before": "MAZDZD",
+      "after": "MjQZD"
+    }
+  }
+}
+```
+
+### Template group cost and click metrics
+
+**Cost metrics** are returned as an array of cost objects, each with a type and value. Types can be:
+
+- `amount_spent` — Total amount spent on conversations opened within the `start` and `end` timeframe as a result of sending the template. See [Opening Conversations](https://developers.facebook.com/documentation/business-messaging/whatsapp/pricing#opening-conversations) .
+- `cost_per_delivered` — The `amount_spent` value divided by the number of times the template was delivered within the `start` and `end` timeframe.
+- `cost_per_url_button_click` — The `amount_spent` value divided by the number of times the template’s URL button was clicked, within the `start` and `end` timeframe. Quick reply button clicks are not included. Object omitted if the template does not have a URL button.
+
+**Click metrics** are returned as an array of JSON objects each with a type and value. Clicks are only returned for URL buttons and quick-reply buttons in templates categorized as `marketing` or `utility`.
+
+Types can be:
+
+- `url_button` — The total number of clicks on the url button.
+- `unique_url_button` — Unique clicks track the number of distinct WhatsApp accounts that have clicked on a button. This metric helps you understand how many individual users are engaging with your CTAs, while eliminating duplicate clicks from the same recipient and providing an accurate measurement of engagement.
+
+## Call analytics
+
+The `call_analytics` field provides the number and type of calls made and received by the phone numbers associated with a specific WABA. When requesting the `call_analytics` field, you can attach the following filtering parameters.
+
+### Call analytics parameters
+
+| Name | Description | Example value |
+| --- | --- | --- |
+| `start`<br>type: UNIX Timestamp | **Required.**<br>The start date for the date range for which you are retrieving analytics. | `1728581152` |
+| `end`<br>type: UNIX Timestamp | **Required.**<br>The end date for the date range for which you are retrieving analytics. | `1728581152` |
+| `granularity`<br>type: String | **Required.**<br>The granularity at which you would like to retrieve the analytics. Supported Options:<br>`HALF_HOUR``DAILY``MONTHLY` | `DAILY` |
+| `phone_numbers`<br>type: Array | **Optional.**<br>An array of phone numbers for which you would like to retrieve analytics. If not provided, all phone numbers added to your WABA are included. | `[15550783881,15550783882]` |
+| `country_codes`<br>type: Array | **Optional.**<br>The countries for which you would like to retrieve analytics. Provide an array with 2 letter country codes for the countries you would like to include. If not provided, analytics will be returned for all countries you have communicated with. | `[US,BR]` |
+| `directions`<br>*Array of enums* | **Optional.**<br>The call direction for which you would like to retrieve the analytics. Supported Options:<br>`USER_INITIATED``BUSINESS_INITIATED` | `USER_INITIATED` |
+| `dimensions`<br>*Array of enums* | **Optional.**<br>List of breakdowns you would like to apply to your metrics. If you send an empty list, we return results without any breakdowns. Supported Options:<br>`phone``direction``country` | `direction` |
+| `metric_types`<br>*Array of enums* | **Optional.**<br>Array of metrics you would like to receive. If you send an empty array, the API returns results for all metric types. Supported Options:<br>`COUNT``COST``AVERAGE_DURATION` | `AVERAGE_DURATION` |
+
+### Example
+
+**Scenario:** You need to get the number of user initiated calls received by all phone numbers associated with your WABA in per day granularity.
+
+**Suggested Solution:** Use following filtering parameters: `start`, `end`, `granularity`, `directions`.
+
+```curl
+curl -i -X GET "https://graph.facebook.com/v25.0/102290129340398
+  ?fields=call_analytics
+  .start(1759302000)
+  .end(1767168000)
+  .granularity(DAILY)
+  .directions(USER_INITIATED)
+  &access_token=BLI8lkj..."
+```
+
+A successful response returns an `call_analytics` object with the data you have requested:
+
+```json
+{
+  "call_analytics": {
+    "granularity": "DAILY",
+    "directions": "USER_INITIATED",
+    "data_points": [
+      {
+          "start": 1765958400,
+          "end": 1766044800,
+          "cost": 0.47795,
+          "count": 35,
+          "average_duration": 106
+      },
+      {
+          "start": 1760943600,
+          "end": 1761030000,
+          "cost": 0,
+          "count": 20,
+          "average_duration": 103
+      },
+      {
+          "start": 1760857200,
+          "end": 1760943600,
+          "cost": 0,
+          "count": 24,
+          "average_duration": 103
+      },
+      # more data points
+    ]
+  },
+  "id": "102290129340398"
+}
+```
+
+## Group analytics
+
+The Group Analytics API allows you to get the number of messages sent, delivered, and read in WhatsApp groups, as well as the number of participants who joined or left.
+
+Data is returned with a daily granularity, with a lookback window of up to 90 days.
+
+### Request syntax
+
+```html
+GET /<WHATSAPP_BUSINESS_ACCOUNT_ID>/group_analytics
+  ?granularity=daily
+  &start=<START_TIME>
+  &end=<END_TIME>
+  &metric_types=[<METRIC_TYPES>]
+  &group_ids=[<GROUP_IDS>]
+```
+
+### Group analytics parameters
+
+| Placeholder | Description | Example value |
+| --- | --- | --- |
+| `<START_TIME>`<br>*UNIX Timestamp* | **Required.**<br>The start time for the date range you are retrieving analytics for. Must be no more than 90 days from the current date. | `1685548801` |
+| `<END_TIME>`<br>*UNIX Timestamp* | **Required.**<br>The end time for the date range you are retrieving analytics for. | `1685721600` |
+| `<GROUP_IDS>`<br>*Array of strings* | **Required.**<br>An array of group IDs for which you wish to get group metrics.<br>Currently only supports 1 ID. | `["GROUP_ID"]` |
+| `<GRANULARITY>`<br>*String* | **Optional.**<br>The granularity at which you would like to retrieve the analytics.<br>Values can be:<br>`DAILY`<br>Default: `DAILY`. | `DAILY` |
+| `<METRIC_TYPES>`<br>*Array of strings* | **Required.**<br>Array of metrics you would like to receive.<br>Values can be:<br>`SENT` — Number of messages sent by the business to the group.`DELIVERED` — Number of times a message was delivered to a participant in the group.`READ` — Number of times a message was read by a participant in the group.`PARTICIPANTS_JOINED` — Number of times a participant joined the group.`PARTICIPANTS_LEFT` — Number of times a participant left the group. | `["SENT","READ","PARTICIPANTS_JOINED"]` |
+
+### Example request
+
+```curl
+curl -g 'https://graph.facebook.com/v25.0/102290129340398/group_analytics?start=1764662400&end=1764921600&granularity=DAILY&group_ids=['GROUP_ID']&metric_types=['SENT','DELIVERED', 'READ','PARTICIPANTS_JOINED','PARTICIPANTS_LEFT']' \
+-H 'Authorization: Bearer EAAJB...'
+```
+
+### Example response
+
+Note that the example below has been truncated with an ellipsis (`...`) for brevity.
+
+```json
+{
+  "data": [
+    {
+      "granularity": "DAILY",
+      "data_points": [
+          {
+            "group_id": "GROUP_ID",
+            "start": 1685548801,
+            "end": 1685635200,
+            "sent": 100,
+            "delivered": 250,
+            "read": 200,
+            "joined": 3,
+            "left": 1
+          },
+          {
+            "group_id": "GROUP_ID",
+            "start": 1685635201,
+            "end": 1685721600,
+            "sent": 80,
+            "delivered": 200,
+            "read": 150,
+            "joined": 1,
+            "left": 0
+          }
+          ...
+        ]
+    }
+  ],
+  "paging": {
+    "cursors": {
+      "before": "MAZDZD",
+      "after": "MjQZD"
+    }
+  }
+}
+```
+
+## Reference
+
+For a list of all possible values for each field, see the Graph API reference of the [WhatsApp Business Account Analytics field](https://developers.facebook.com/docs/graph-api/reference/waba-analytics).
