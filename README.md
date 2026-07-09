@@ -37,6 +37,13 @@ Kurulum komutları tek bir kanonik yerde — burada tekrarlanmaz:
 │   │   ├── booking.py            create_appointment + slot kontrol + format_price
 │   │   ├── availability.py       slot hesabı (saatler, izinler, çakışma, oda)
 │   │   └── format.py             kanal/araç çıktısı için ortak metin biçimlendirme (saf fonksiyonlar)
+│   ├── voice/                    Sesli Randevu Asistanı (Voice Agent)
+│   │   ├── audio_socket.py       Asterisk TCP AudioSocket asenkron sunucusu (8010 portu)
+│   │   ├── stt.py                faster-whisper ile konuşmayı metne dökme (STT) + VAD
+│   │   ├── llm.py                Groq / Ollama kısa-öz Türkçe sesli asistan beyni
+│   │   ├── tools.py              MongoDB randevu kontrolü & booking entegrasyonu
+│   │   ├── tts.py                Piper TTS ile metni 8kHz PCM sese dönüştürme
+│   │   └── pipeline.py           STT -> LLM -> TTS akış ve söz kesme (barge-in) yöneticisi
 │   └── channels/
 │       ├── whatsapp/
 │       │   ├── client.py         parse, signature, send_text

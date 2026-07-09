@@ -340,37 +340,37 @@ Bot:    [tool: update_customer_name → create_appointment]
 **Çıktı:** Telefon eden müşteri Asterisk'ten kayıtlı bir karşılama duyabiliyor.
 
 ### Faz 1 — STT/TTS prototipi (1-2 hafta)
-- [ ] `faster-whisper` Türkçe transcription benchmark (örnek 50 ses kaydı).
-- [ ] Piper Türkçe TTS sample, telefon kalitesinde 8kHz mono ile test.
-- [ ] AudioSocket TCP server (Python asyncio).
-- [ ] Round-trip echo test: telefonla konuş → transcribe → aynı metni TTS ile geri oku.
+- [x] `faster-whisper` Türkçe transcription benchmark (örnek 50 ses kaydı).
+- [x] Piper Türkçe TTS sample, telefon kalitesinde 8kHz mono ile test.
+- [x] AudioSocket TCP server (Python asyncio).
+- [x] Round-trip echo test: telefonla konuş → transcribe → aynı metni TTS ile geri oku.
 
 **Çıktı:** Bot, müşterinin söylediğini tekrar edebiliyor (papağan modu).
 
 ### Faz 2 — LLM entegrasyonu (1 hafta)
-- [ ] `app/voice/pipeline.py` — STT → LLM → TTS state machine.
-- [ ] `app/voice/llm.py` yaz: Ollama OpenAI-compat endpoint + tool-use döngüsü (`channel="voice"`).
-- [ ] `app/voice/tools.py` yaz: `list_services`, `list_available_slots`, `list_staff_available_at`, `create_appointment` (§6.2).
-- [ ] Voice-spesifik sistem prompt (§6.3).
-- [ ] Filler audio ("bir saniye bakıyorum...") tool çağrılarında.
+- [x] `app/voice/pipeline.py` — STT → LLM → TTS state machine.
+- [x] `app/voice/llm.py` yaz: Ollama OpenAI-compat endpoint + tool-use döngüsü (`channel="voice"`).
+- [x] `app/voice/tools.py` yaz: `list_services`, `list_available_slots`, `list_staff_available_at`, `create_appointment` (§6.2).
+- [x] Voice-spesifik sistem prompt (§6.3).
+- [x] Filler audio ("bir saniye bakıyorum...") tool çağrılarında.
 
 **Çıktı:** Bot, küçük diyaloglarda doğal cevap veriyor; randevu oluşturmuyor henüz.
 
 ### Faz 3 — Tam randevu akışı (1-2 hafta)
-- [ ] `list_services` → `list_available_slots` → `list_staff_available_at` → `create_appointment` zinciri.
-- [ ] `end_call` ve `transfer_to_human` tool'ları.
-- [ ] `conversations.channel="voice"` desteği orchestrator'a eklenmesi.
-- [ ] Ses kaydı (KVKK opt-in metniyle başlangıçta uyarı).
+- [x] `list_services` → `list_available_slots` → `list_staff_available_at` → `create_appointment` zinciri.
+- [x] `end_call` ve `transfer_to_human` tool'ları.
+- [x] `conversations.channel="voice"` desteği orchestrator'a eklenmesi.
+- [x] Ses kaydı (KVKK opt-in metniyle başlangıçta uyarı).
 
 **Çıktı:** Tek bir test işletmesi için bot baştan sona randevu alıyor.
 
 ### Faz 4 — Latency optimizasyonu (1-2 hafta)
-- [ ] Streaming TTS (Piper cümle-cümle).
-- [ ] LLM warm-pool (Ollama `keep_alive=-1`).
-- [ ] Whisper int8 CPU profili veya GPU consolidation.
-- [ ] Filler bank: 5-6 farklı "bekleme" sesi rastgele.
-- [ ] Barge-in (müşteri sözünü kestiğinde TTS dur).
-- [ ] p95 latency < 2.5 s, p50 < 1.5 s hedefi.
+- [x] Streaming TTS (Piper cümle-cümle).
+- [x] LLM warm-pool (Ollama `keep_alive=-1`).
+- [x] Whisper int8 CPU profili veya GPU consolidation.
+- [x] Filler bank: 5-6 farklı "bekleme" sesi rastgele.
+- [x] Barge-in (müşteri sözünü kestiğinde TTS dur).
+- [x] p95 latency < 2.5 s, p50 < 1.5 s hedefi.
 
 ### Faz 5 — Multi-tenant + Production (2 hafta)
 - [ ] Numara → business eşleme (`businesses.channels.voice.inbound_number`).
