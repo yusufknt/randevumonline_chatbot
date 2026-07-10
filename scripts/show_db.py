@@ -49,23 +49,44 @@ async def show_database_summary() -> None:
     async for a in db.appointments.find().sort("start_time", 1):
         appointments.append(a)
 
-    print(f"\n📅 KAYITLI RANDEVULAR ({len(appointments)} kayıt):")
+    print(f"\n📅 KAYITLI DETAYLI RANDEVULAR ({len(appointments)} kayıt):")
     if not appointments:
         print("   (Henüz kayıtlı randevu bulunmuyor)")
     else:
-        print(
-            f"   {'KAYNAK':<10} | {'TARİH & SAAT (UTC)':<20} | {'DURUM':<10} | {'TUTAR'}"
-        )
-        print("   " + "-" * 58)
+        header = f"   {'TARİH & SAAT (TR)':<19} | {'MÜŞTERİ ADI':<22} | {'USTA (PERSONEL)':<18} | {'HİZMET':<18} | {'DURUM':<10} | {'TUTAR'}"
+        print(header)
+        print("   " + "-" * 105)
         for a in appointments:
-            source = a.get("source", "whatsapp").upper()
+            # Tarih & Saat (+3 saat Türkiye Saati)
             start_dt = a.get("start_time")
-            dt_str = start_dt.strftime("%Y-%m-%d %H:%M") if isinstance(start_dt, datetime) else str(start_dt)
+            if isinstance(start_dt, datetime):
+                from datetime import timedelta
+                tr_dt = start_dt + timedelta(hours=3)
+                dt_str = tr_dt.strftime("%d.%m.%Y - %H:%M")
+            else:
+                dt_str = str(start_dt)
+
+            # Müşteri Bilgisi
+            cust = await db.customers.find_one({"_id": a.get("customer_id")})
+            cust_name = cust.get("name", "Bilinmiyor") if cust else "Bilinmiyor"
+
+            # Personel (Usta) Bilgisi
+            staff = await db.staff.find_one({"_id": a.get("staff_id")})
+            staff_name = staff.get("name", "Bilinmiyor") if staff else "Bilinmiyor"
+
+            # Hizmet Bilgisi
+            service_names = []
+            for s_id in a.get("services", []):
+                srv = await db.services.find_one({"_id": s_id})
+                if srv:
+                    service_names.append(srv.get("name", ""))
+            srv_str = ", ".join(service_names) if service_names else "Saç Kesimi"
+
             status = a.get("status", "pending")
             price = str(a.get("total_price", "0"))
-            print(f"   {source:<10} | {dt_str:<20} | {status:<10} | {price} TL")
+            print(f"   {dt_str:<19} | {cust_name:<22} | {staff_name:<18} | {srv_str:<18} | {status:<10} | {price} TL")
 
-    print("\n" + "=" * 65)
+    print("\n" + "=" * 108)
 
 
 def main() -> None:

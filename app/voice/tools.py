@@ -8,7 +8,7 @@ ve randevu oluşturma fonksiyonlarını barındırır.
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime, timezone
+from datetime import date
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -125,6 +125,8 @@ class VoiceToolExecutor:
                 "name": customer_name,
             })
             customer = await db.customers.find_one({"_id": res.inserted_id})
+        if not customer:
+            return {"error": "customer_not_found"}
 
         conversation = await db.conversations.find_one({
             "business_id": business["_id"],
@@ -136,6 +138,8 @@ class VoiceToolExecutor:
                 "channel": "voice",
             })
             conversation = await db.conversations.find_one({"_id": res.inserted_id})
+        if not conversation:
+            return {"error": "conversation_not_found"}
 
         result = await create_appointment(
             db=db,

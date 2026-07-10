@@ -138,6 +138,8 @@ async def _post_chat(
         log.warning("Groq 429 — %.1fs bekleyip tekrar deneniyor (attempt=%d)",
                     wait, attempt + 1)
         await asyncio.sleep(wait)
+    if resp is None:
+        raise RuntimeError("Groq API isteği yapılamadı")
     if resp.status_code >= 400:
         log.error("Groq %d yanıtı: %s", resp.status_code, resp.text[:2000])
     return resp

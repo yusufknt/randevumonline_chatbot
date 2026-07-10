@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import struct
+from typing import Any
 
 from app.voice.config import get_voice_settings
 from app.voice.models import (
