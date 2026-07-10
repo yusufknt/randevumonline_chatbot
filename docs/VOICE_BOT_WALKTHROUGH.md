@@ -61,6 +61,13 @@ Müşteri daha önce alınmış veya dolu bir saat için randevu talep ettiğind
 - Asistan müşteriye net bir geri bildirim verir:
   > *"Maalesef seçtiğiniz 14:00 saati için veritabanımızda zaten bir randevu bulunuyor ve dolu! Lütfen başka bir saat tercih edin."*
 
+### 3.4 Çok Personelli (Berber Mehmet & Yusuf Usta) Akıllı Randevu Yönetimi
+Sesli asistan sadece tek bir ustayı değil, işletmedeki farklı personelleri ayırt edebilecek yeteneğe kavuşturulmuştur:
+- **Personel Algılama:** Konuşma sırasında müşterinin Mehmet Kaya veya Yusuf Demir ustayı tercih edip etmediği algılanır.
+- **Aktif Yönlendirme:** Müşteri sadece gün ve saat belirtip usta seçmediyse asistan proaktif olarak sorar:
+  > *"Pazar günü (12.07.2026) saat 09:00 için Saç Kesimi randevusu almak istiyorsunuz. Mehmet usta için mi yoksa Yusuf usta için mi alalım?"*
+- **Otomatik Alternatif Önerisi / Yedekleme:** Tercih edilen ustanın o saatte dolu olması durumunda, sistem diğer ustanın müsaitliğini kontrol eder ve müşteriyi mağdur etmeden randevuyu uygun ustaya kaydeder.
+
 ---
 
 ## 4. Test ve İzleme Araçları
@@ -89,19 +96,21 @@ docker exec randevum_api python -m scripts.show_db
 👥 MÜŞTERİLER (3 kayıt):
    • Yusuf Kantarcıoğlu        | Telefon: +905321112233
 
-📅 KAYITLI RANDEVULAR:
-   KAYNAK     | TARİH & SAAT (UTC)   | DURUM      | TUTAR
-   ----------------------------------------------------------
-   VOICE      | 2026-07-10 11:00     | confirmed  | 250 TL
-   VOICE      | 2026-07-10 13:00     | confirmed  | 250 TL
-   WHATSAPP   | 2026-07-11 14:00     | confirmed  | 380 TL
+📅 KAYITLI DETAYLI RANDEVULAR (12 kayıt):
+   TARİH & SAAT (TR)   | MÜŞTERİ ADI            | USTA (PERSONEL)    | HİZMET             | DURUM      | TUTAR
+   ---------------------------------------------------------------------------------------------------------
+   12.07.2026 - 09:00  | Yusuf Kantarcıoğlu     | Mehmet Kaya        | Saç Kesimi         | confirmed  | 250 TL
+   12.07.2026 - 15:00  | Yusuf Kantarcıoğlu     | Mehmet Kaya        | Saç Kesimi         | confirmed  | 250 TL
+   12.07.2026 - 15:00  | Yusuf Kantarcıoğlu     | Yusuf Demir        | Saç Kesimi         | confirmed  | 250 TL
 ```
 
 ---
 
 ## 5. Doğrulama ve Sonuçlar
 
-- ✅ **Gerçek Zamanlı Kayıt:** Sesli bot üzerinden alınan randevular MongoDB `appointments` tablosuna `source: "voice"` ve `status: "confirmed"` olarak başarıyla işlenmektedir.
+- ✅ **Gerçek Zamanlı Kayıt & Çoklu Personel Desteği:** Sesli bot üzerinden alınan randevular seçilen ustaya (Mehmet Kaya / Yusuf Demir) göre MongoDB `appointments` tablosuna `source: "voice"` ve `status: "confirmed"` olarak işlenmektedir.
+- ✅ **Detaylı Raporlama:** `show_db.py` betiği randevuları Türkiye saati (+3), müşteri adı, usta adı ve hizmet bilgileriyle birlikte detaylı tablo olarak sunmaktadır.
+- ✅ **Statik Tip Güvenliği (`0 errors, 0 warnings`):** Ses modülü (`app/voice/`) ve çekirdek yapay zeka katmanındaki tüm eksik tip anotasyonları (`Any`) ile olası null erişim riski taşıyan noktalar giderilmiştir.
 - ✅ **Clean Repository:** Geçici ses dosyaları temizlenmiş ve `.gitignore` dosyasına `*.wav` eklenerek projenin temizliği garanti altına alınmıştır.
 
 ### Hızlı Komut Referansı
