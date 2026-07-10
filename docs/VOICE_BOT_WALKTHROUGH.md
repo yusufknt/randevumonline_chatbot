@@ -36,7 +36,7 @@ Tüm sesli asistan mimarisi clean code prensiplerine uygun şekilde **`app/voice
 | **`stt.py`** | Sesi Yazıya Çevirme (STT) | Konuşma bitişi algılama (VAD) ve Türkçe transkripsiyon motoru. |
 | **`llm.py`** | Yapay Zeka Konuşma Motoru | Çok turlu diyalog geçmişi (`history`), dinamik saat yakalayıcı (`regex`) ve veritabanı çakışma engelleyici. |
 | **`tools.py`** | Veritabanı Araç Katmanı | `check_availability` ve `book_appointment` ile doğrudan gerçek MongoDB bağlamı. |
-| **`tts.py`** | Metinden Sese Dönüştürme (TTS) | Türkçe ses sentezleyici katmanı. |
+| **`tts.py`** | Metinden Sese Dönüştürme (TTS) | Edge Neural TTS (`tr-TR-EmelNeural`) ile Windows/Mac/Linux platformlarında birebir aynı Türkçe doğal ses. |
 | **`pipeline.py`** | Uçtan Uca Boru Hattı | STT $\rightarrow$ LLM $\rightarrow$ TTS senkronizasyonu ve çift yönlü akış yönetimi. |
 
 ---

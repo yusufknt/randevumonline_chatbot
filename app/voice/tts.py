@@ -42,15 +42,52 @@ class TextToSpeechEngine:
     def _synthesize_pcm(self, text: str) -> bytes:
         """Metni 8kHz 16-bit PCM formatına dönüştürür."""
         try:
-            # Önce Piper TTS CLI veya kütüphane denemesi
-            return self._run_piper_tts(text)
+            return self._run_edge_tts(text)
         except Exception:
-            # Piper kurulu değilse test ve geliştirme için deterministik ses yükü üret
-            duration_s = min(max(len(text) * 0.06, 0.5), 3.0)
-            sample_count = int(self.sample_rate * duration_s)
-            return b"\x00\x00" * sample_count
+            try:
+                return self._run_piper_tts(text)
+            except Exception:
+                duration_s = min(max(len(text) * 0.06, 0.5), 3.0)
+                sample_count = int(self.sample_rate * duration_s)
+                return b"\x00\x00" * sample_count
+
+    def _run_edge_tts(self, text: str) -> bytes:
+        """Edge Neural TTS ile ses sentezleyip 8kHz 16-bit PCM formatına çevirir."""
+        import subprocess
+        import tempfile
+        import edge_tts
+
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as mp3_f:
+            mp3_path = mp3_f.name
+        with tempfile.NamedTemporaryFile(suffix=".raw", delete=False) as raw_f:
+            raw_path = raw_f.name
+
+        try:
+            async def _synth():
+                c = edge_tts.Communicate(text, "tr-TR-EmelNeural")
+                await c.save(mp3_path)
+
+            asyncio.run(_synth())
+
+            subprocess.run([
+                "ffmpeg", "-y", "-i", mp3_path,
+                "-f", "s16le", "-ar", str(self.sample_rate), "-ac", "1",
+                raw_path
+            ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+            with open(raw_path, "rb") as f:
+                return f.read()
+        finally:
+            for p in (mp3_path, raw_path):
+                import os
+                if os.path.exists(p):
+                    try:
+                        os.remove(p)
+                    except OSError:
+                        pass
 
     @staticmethod
     def _run_piper_tts(text: str) -> bytes:
         """Piper TTS üzerinden ses sentezlemeye çalışır."""
         raise NotImplementedError("Piper TTS henüz kurulmadı")
+

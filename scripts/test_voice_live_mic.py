@@ -67,7 +67,7 @@ def record_real_speech(duration_sec: int = 5, sample_rate: int = 16000) -> str:
         recognizer = sr.Recognizer()
         with sr.AudioFile(temp_wav) as source:
             audio_data = recognizer.record(source)
-            text = recognizer.recognize_google(audio_data, language="tr-TR")
+            text = recognizer.recognize_google(audio_data, language="tr-TR")  # type: ignore
             return str(text)
     except ImportError:
         logger.error("Lütfen terminalde çalıştırın: python3 -m pip install SpeechRecognition")
@@ -84,14 +84,42 @@ def record_real_speech(duration_sec: int = 5, sample_rate: int = 16000) -> str:
 
 
 def speak_out_loud(text: str) -> None:
-    """Metni Mac hoparlöründen canlı Türkçe ses olarak okur."""
+    """Metni Edge Neural TTS (tr-TR-EmelNeural) ile Windows/Mac/Linux üzerinde birebir aynı doğal sesle okur."""
     logger.info("🔊 Hoparlörden Okunuyor: '%s'", text)
-    if sys.platform == "darwin":
-        try:
-            # macOS dahili Türkçe ses sentezleyicisini kullanmayı dene (Örn: Yelda veya varsayılan)
+    temp_mp3 = "temp_voice.mp3"
+    try:
+        import edge_tts
+
+        async def _save_mp3():
+            communicate = edge_tts.Communicate(text, "tr-TR-EmelNeural")
+            await communicate.save(temp_mp3)
+
+        asyncio.run(_save_mp3())
+
+        if sys.platform == "darwin":
+            subprocess.run(["afplay", temp_mp3], check=False)
+        elif sys.platform == "win32":
+            abs_mp3 = os.path.abspath(temp_mp3)
+            ps_cmd = (
+                f'Add-Type -AssemblyName presentationCore; '
+                f'$player = New-Object System.Windows.Media.MediaPlayer; '
+                f'$player.Open([System.Uri]"{abs_mp3}"); '
+                f'$player.Play(); '
+                f'Start-Sleep -Seconds 4;'
+            )
+            subprocess.run(["powershell", "-Command", ps_cmd], check=False)
+        else:
+            subprocess.run(["mpv", temp_mp3], check=False)
+    except Exception as exc:
+        logger.warning("edge-tts sesi çalınamadı (%s), işletim sistemi yerleşik sesi deneniyor...", exc)
+        if sys.platform == "darwin":
             subprocess.run(["say", text], check=False)
-        except Exception as exc:
-            logger.warning("macOS 'say' komutu çalışmadı: %s", exc)
+    finally:
+        if os.path.exists(temp_mp3):
+            try:
+                os.remove(temp_mp3)
+            except OSError:
+                pass
 
 
 async def run_live_mic_test(record_duration: int = 5) -> None:
