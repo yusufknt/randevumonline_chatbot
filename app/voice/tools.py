@@ -43,8 +43,23 @@ class VoiceToolExecutor:
     """Sesli asistanın veritabanı araçlarını çalıştıran yönetici sınıf."""
 
     @staticmethod
-    async def check_availability(business_slug: str, service_name: str, target_date_str: str) -> dict[str, Any]:
-        """Belirtilen gün için müsait randevu saatlerini döndürür."""
+    async def get_services(business_slug: str) -> list[str]:
+        """İşletmeye ait aktif hizmet/kategori isimlerini veritabanından getirir."""
+        db = get_db()
+        business = await db.businesses.find_one({"business_id": business_slug})
+        if not business:
+            return []
+        services = await db.services.find({"business_id": business["_id"]}).to_list(100)
+        return [str(s["name"]) for s in services if "name" in s]
+
+    @staticmethod
+    async def check_availability(
+        business_slug: str,
+        service_name: str,
+        target_date_str: str,
+        staff_name: str | None = None,
+    ) -> dict[str, Any]:
+        """Belirtilen usta ve gün için müsait randevu saatlerini döndürür."""
         db = get_db()
         business = await db.businesses.find_one({"business_id": business_slug})
         if not business:
@@ -57,10 +72,14 @@ class VoiceToolExecutor:
         if not service:
             return {"error": "service_not_found"}
 
-        staff = await db.staff.find_one({
+        staff_query: dict[str, Any] = {
             "business_id": business["_id"],
             "service_ids": service["_id"],
-        })
+        }
+        if staff_name:
+            staff_query["name"] = {"$regex": f"^{staff_name}$", "$options": "i"}
+
+        staff = await db.staff.find_one(staff_query)
         if not staff:
             return {"error": "no_staff_for_service"}
 
@@ -77,11 +96,18 @@ class VoiceToolExecutor:
             start_date=target_date,
             days_to_scan=1,
             max_slots=5,
+            step_minutes=60,
         )
-        slot_strs = [s.strftime("%H:%M") for s in slots]
+        slot_strs = []
+        for s in slots:
+            from datetime import timedelta
+            local_s = s + timedelta(hours=3)
+            slot_strs.append(local_s.strftime("%H:%M"))
+
         return {
             "status": "success",
             "date": target_date_str,
+            "staff": staff.get("name", ""),
             "available_slots": slot_strs,
         }
 

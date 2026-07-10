@@ -27,6 +27,21 @@ class VoiceSettings(BaseSettings):
     voice_session_timeout_s: float = 300.0
     voice_log_level: str = "INFO"
 
+    # DeepSeek LLM Ayarları
+    deepseek_api_key: str | None = None
+    deepseek_base_url: str = "https://api.deepseek.com"
+    deepseek_model: str = "deepseek-chat"
+    ai_request_timeout_s: float = 15.0
+
+    # Görüşme Süresi ve Limit Koruması (Graceful Exit / Fallback)
+    voice_max_call_duration_s: float = 180.0
+    voice_max_turns: int = 15
+    voice_timeout_message: str = (
+        "Görüşme süremizin sonuna geldik, randevu talebinizle ilgili detayları "
+        "SMS olarak ileteceğiz. İyi günler dileriz."
+    )
+
+
 
 @lru_cache
 def get_voice_settings() -> VoiceSettings:
