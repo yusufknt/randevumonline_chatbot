@@ -76,11 +76,12 @@ async def show_database_summary() -> None:
 
             # Hizmet Bilgisi
             service_names = []
-            for s_id in a.get("services", []):
+            for s_item in a.get("services", []):
+                s_id = s_item.get("service_id") if isinstance(s_item, dict) else s_item
                 srv = await db.services.find_one({"_id": s_id})
                 if srv:
                     service_names.append(srv.get("name", ""))
-            srv_str = ", ".join(service_names) if service_names else "Saç Kesimi"
+            srv_str = ", ".join(service_names) if service_names else "Bilinmiyor"
 
             status = a.get("status", "pending")
             price = str(a.get("total_price", "0"))
@@ -88,7 +89,8 @@ async def show_database_summary() -> None:
 
     print("\n" + "=" * 108)
 
-
+    from app.core.db import close_client
+    await close_client()
 def main() -> None:
     asyncio.run(show_database_summary())
 

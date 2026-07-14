@@ -43,6 +43,22 @@ class VoiceToolExecutor:
     """Sesli asistanın veritabanı araçlarını çalıştıran yönetici sınıf."""
 
     @staticmethod
+    async def get_business_info(business_slug: str) -> dict[str, Any] | None:
+        """İşletmenin temel bilgilerini veritabanından getirir."""
+        db = get_db()
+        return await db.businesses.find_one({"business_id": business_slug})
+
+    @staticmethod
+    async def get_staff(business_slug: str) -> list[str]:
+        """İşletmeye ait aktif personelleri (ustaları) veritabanından getirir."""
+        db = get_db()
+        business = await db.businesses.find_one({"business_id": business_slug})
+        if not business:
+            return []
+        staff_members = await db.staff.find({"business_id": business["_id"]}).to_list(100)
+        return [str(s["name"]) for s in staff_members if "name" in s]
+
+    @staticmethod
     async def get_services(business_slug: str) -> list[str]:
         """İşletmeye ait aktif hizmet/kategori isimlerini veritabanından getirir."""
         db = get_db()
@@ -55,7 +71,7 @@ class VoiceToolExecutor:
     @staticmethod
     async def check_availability(
         business_slug: str,
-        service_name: str,
+        service_name: str | None,
         target_date_str: str,
         staff_name: str | None = None,
     ) -> dict[str, Any]:
@@ -65,23 +81,47 @@ class VoiceToolExecutor:
         if not business:
             return {"error": "business_not_found"}
 
-        service = await db.services.find_one({
-            "business_id": business["_id"],
-            "name": {"$regex": f"^{service_name}$", "$options": "i"},
-        })
-        if not service:
-            return {"error": "service_not_found"}
+        import difflib
+
+        # 1. Service eşleşmesi (Fuzzy Search) - Opsiyonel
+        service = None
+        if service_name and service_name.lower() != "belirsiz":
+            services = await db.services.find({"business_id": business["_id"]}).to_list(100)
+            if services:
+                service_names = [s["name"] for s in services]
+                matches = difflib.get_close_matches(service_name, service_names, n=1, cutoff=0.3)
+                if matches:
+                    service = next(s for s in services if s["name"] == matches[0])
+                    
+            if not service:
+                return {"error": "service_not_found"}
 
         staff_query: dict[str, Any] = {
             "business_id": business["_id"],
-            "service_ids": service["_id"],
         }
+        if service:
+            staff_query["service_ids"] = service["_id"]
+        
+        # 2. Personel eşleşmesi (Fuzzy Search)
+        staff = None
         if staff_name:
-            staff_query["name"] = {"$regex": f"^{staff_name}$", "$options": "i"}
+            staffs = await db.staff.find(staff_query).to_list(100)
+            if staffs:
+                first_name = staff_name.split()[0].lower()
+                for stf in staffs:
+                    if first_name in stf["name"].lower():
+                        staff = stf
+                        break
+        else:
+            # Usta belirtilmemişse ilkini seç
+            staff = await db.staff.find_one(staff_query)
 
-        staff = await db.staff.find_one(staff_query)
         if not staff:
-            return {"error": "no_staff_for_service"}
+            return {"error": "staff_not_found"}
+            
+        # Hizmet bilinmiyorsa, süre hesaplaması için standart 30 dk varsay
+        if not service:
+            service = {"_id": "dummy", "duration_minutes": 30}
 
         try:
             target_date = date.fromisoformat(target_date_str)
@@ -126,17 +166,32 @@ class VoiceToolExecutor:
         if not business:
             return {"error": "business_not_found"}
 
-        service = await db.services.find_one({
-            "business_id": business["_id"],
-            "name": {"$regex": f"^{service_name}$", "$options": "i"},
-        })
+        import difflib
+
+        # 1. Service eşleşmesi (Fuzzy Search)
+        services = await db.services.find({"business_id": business["_id"]}).to_list(100)
+        service = None
+        if services:
+            # En yakın eşleşmeyi bul
+            service_names = [s["name"] for s in services]
+            matches = difflib.get_close_matches(service_name, service_names, n=1, cutoff=0.3)
+            if matches:
+                service = next(s for s in services if s["name"] == matches[0])
+                
         if not service:
             return {"error": "service_not_found"}
 
-        staff = await db.staff.find_one({
-            "business_id": business["_id"],
-            "name": {"$regex": f"^{staff_name}$", "$options": "i"},
-        })
+        # 2. Personel eşleşmesi (Fuzzy Search)
+        staffs = await db.staff.find({"business_id": business["_id"]}).to_list(100)
+        staff = None
+        if staffs:
+            # Sadece ilk ismiyle arama yap ("Yusuf Usta" -> "Yusuf")
+            first_name = staff_name.split()[0].lower()
+            for stf in staffs:
+                if first_name in stf["name"].lower():
+                    staff = stf
+                    break
+                    
         if not staff:
             return {"error": "staff_not_found"}
 
@@ -176,6 +231,69 @@ class VoiceToolExecutor:
             staff=staff,
             start_local=start_time_local,
             source="voice",
-            created_by="voice_agent",
+            created_by="voice_assistant",
         )
         return result
+
+    @staticmethod
+    async def cancel_appointment(appointment_id: str) -> bool:
+        db = get_db()
+        from app.core.booking import cancel_appointment
+        return await cancel_appointment(db, appointment_id, reason="voice_assistant_cancelled")
+
+    @staticmethod
+    async def reschedule_appointment(
+        business_slug: str,
+        appointment_id: str,
+        new_start_local: str
+    ) -> dict[str, Any]:
+        db = get_db()
+        business = await db.businesses.find_one({"business_id": business_slug})
+        if not business:
+            return {"error": "business_not_found"}
+            
+        from app.core.booking import reschedule_appointment
+        return await reschedule_appointment(db, appointment_id, new_start_local, business)
+
+    @staticmethod
+    async def get_customer_appointments(business_slug: str, customer_phone: str) -> list[dict[str, Any]]:
+        db = get_db()
+        business = await db.businesses.find_one({"business_id": business_slug})
+        if not business:
+            return []
+            
+        customer = await db.customers.find_one({"business_id": business["_id"], "phone": customer_phone})
+        if not customer:
+            return []
+            
+        # Gelecekteki aktif randevuları getir
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+        
+        cursor = db.appointments.find({
+            "business_id": business["_id"],
+            "customer_id": customer["_id"],
+            "status": {"$in": ["pending", "confirmed"]},
+            "start_time": {"$gt": now}
+        }).sort("start_time", 1)
+        
+        apts = []
+        async for a in cursor:
+            # Usta ve hizmet ismini bul
+            staff = await db.staff.find_one({"_id": a["staff_id"]})
+            staff_name = staff["name"] if staff else "Bilinmiyor"
+            
+            service_name = a["services"][0]["name"] if a.get("services") else "Bilinmiyor"
+            
+            from zoneinfo import ZoneInfo
+            tz = ZoneInfo(business.get("timezone", "Europe/Istanbul"))
+            start_local = a["start_time"].astimezone(tz)
+            
+            apts.append({
+                "id": str(a["_id"]),
+                "staff": staff_name,
+                "service": service_name,
+                "date": start_local.strftime("%Y-%m-%d %H:%M")
+            })
+            
+        return apts

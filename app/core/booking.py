@@ -175,3 +175,73 @@ async def find_staff_available_at(
         if any(w_s <= s_t and e_t <= w_e for (w_s, w_e) in windows):
             out.append(st)
     return out
+
+
+async def cancel_appointment(
+    db: AsyncIOMotorDatabase,
+    appointment_id: str,
+    reason: str = "customer_cancelled"
+) -> bool:
+    from bson.objectid import ObjectId
+    try:
+        oid = ObjectId(appointment_id)
+    except Exception:
+        return False
+
+    res = await db.appointments.delete_one(
+        {"_id": oid, "status": {"$in": ["pending", "confirmed"]}}
+    )
+    return res.deleted_count > 0
+
+
+async def reschedule_appointment(
+    db: AsyncIOMotorDatabase,
+    appointment_id: str,
+    new_start_local: str,
+    business: dict
+) -> dict:
+    from bson.objectid import ObjectId
+    try:
+        oid = ObjectId(appointment_id)
+    except Exception:
+        return {"error": "invalid_appointment_id"}
+
+    apt = await db.appointments.find_one({"_id": oid, "status": {"$in": ["pending", "confirmed"]}})
+    if not apt:
+        return {"error": "appointment_not_found"}
+
+    tz = business.get("timezone", "Europe/Istanbul")
+    try:
+        new_start_utc = _parse_local(new_start_local, tz)
+    except ValueError:
+        return {"error": "invalid_start_time"}
+        
+    duration = apt["services"][0]["duration_minutes"]
+    new_end_utc = new_start_utc + timedelta(minutes=duration)
+
+    # Atomik çakışma kontrolü (Kendi ID'si hariç)
+    conflict = await db.appointments.find_one({
+        "business_id": apt["business_id"],
+        "staff_id": apt["staff_id"],
+        "_id": {"$ne": oid},
+        "status": {"$in": ["pending", "confirmed"]},
+        "start_time": {"$lt": new_end_utc},
+        "end_time": {"$gt": new_start_utc},
+    })
+    if conflict:
+        return {"error": "slot_taken"}
+
+    await db.appointments.update_one(
+        {"_id": oid},
+        {"$set": {
+            "start_time": new_start_utc,
+            "end_time": new_end_utc,
+            "updated_at": datetime.now(timezone.utc)
+        }}
+    )
+
+    return {
+        "status": "rescheduled",
+        "appointment_id": appointment_id,
+        "new_start_local": local_iso(new_start_utc, tz)
+    }

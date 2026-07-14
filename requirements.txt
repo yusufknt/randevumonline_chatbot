@@ -21,3 +21,4 @@ edge-tts>=7.0
 # - Pillow / phonenumbers / python-dateutil: kaldırıldı (eski görsel/calendar_image
 #   modülleriyle birlikte). Aktif AI (app/core/ai.py + tools.py — Groq, OpenAI-uyumlu)
 #   yalnız httpx kullanır; ek paket gerektirmez.
+pygame-ce==2.5.7

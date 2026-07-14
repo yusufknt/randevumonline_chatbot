@@ -41,6 +41,12 @@ class VoiceSettings(BaseSettings):
         "SMS olarak ileteceğiz. İyi günler dileriz."
     )
 
+    # Yeni Voice API (TTS) Ayarları
+    tts_api_key: str | None = None
+    tts_api_gender: str = "erkek"
+    tts_api_emotion: str = "motivasyon"
+    tts_api_base_url: str = "https://voiceapi.createupload.com"
+
 
 
 @lru_cache
