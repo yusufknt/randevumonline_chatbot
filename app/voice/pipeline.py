@@ -47,18 +47,35 @@ class VoicePipeline:
         self.session.update_state(SessionState.LISTENING)
 
         # 2. STT: Konuşmayı metne dök
-        transcribed_text = await self.stt.transcribe(pcm_audio)
+        try:
+            transcribed_text = await self.stt.transcribe(pcm_audio)
+        except Exception as e:
+            logger.error("❌ STT Hatası (Sistem Çökmeyecek): %s (session_id=%s)", str(e), self.session.session_id)
+            transcribed_text = ""
+
         if not transcribed_text:
             return
 
-        logger.info("Müşteri konuştu: '%s' (session_id=%s)", transcribed_text, self.session.session_id)
+        logger.info("✅ STT tamamlandı. Müşteri konuştu: '%s' (session_id=%s)", transcribed_text, self.session.session_id)
         self.session.update_state(SessionState.PROCESSING)
 
         # 3. LLM: Cevap üret
-        assistant_reply = await self.llm.generate_response(transcribed_text)
-        logger.info("Asistan cevabı: '%s' (session_id=%s)", assistant_reply, self.session.session_id)
+        logger.info("⏳ LLM'e istek gönderiliyor...")
+        try:
+            assistant_reply = await asyncio.wait_for(
+                self.llm.generate_response(transcribed_text), 
+                timeout=20.0
+            )
+            logger.info("🧠 LLM cevabı üretildi: '%s' (session_id=%s)", assistant_reply, self.session.session_id)
+        except asyncio.TimeoutError:
+            logger.warning("⚠️ LLM Timeout Hatası (session_id=%s). Fallback cevap gönderilecek.", self.session.session_id)
+            assistant_reply = "Sistemde geçici bir yoğunluk var, lütfen biraz bekleyip tekrar söyleyebilir misiniz?"
+        except Exception as e:
+            logger.error("❌ LLM Hatası: %s (session_id=%s)", str(e), self.session.session_id)
+            assistant_reply = "Bir hata oluştu, lütfen daha sonra tekrar deneyin."
 
         # 4. TTS: Sese çevir ve gönder
+        logger.info("🗣️ TTS üretiliyor ve ses geri gönderiliyor...")
         self.session.update_state(SessionState.SPEAKING)
         self._tts_task = asyncio.create_task(self._stream_tts(assistant_reply, send_audio_cb))
 
@@ -72,7 +89,11 @@ class VoicePipeline:
             async for chunk in self.tts.synthesize_stream(text):
                 await send_audio_cb(chunk)
                 self.session.total_audio_frames_sent += 1
+            logger.info("✅ TTS ses parçaları başarıyla müşteriye iletildi. (session_id=%s)", self.session.session_id)
             self.session.update_state(SessionState.LISTENING)
         except asyncio.CancelledError:
             logger.debug("TTS yayını iptal edildi (Barge-in tetiklendi)")
             raise
+        except Exception as e:
+            logger.error("❌ TTS Hatası: %s (session_id=%s)", str(e), self.session.session_id)
+            self.session.update_state(SessionState.LISTENING)

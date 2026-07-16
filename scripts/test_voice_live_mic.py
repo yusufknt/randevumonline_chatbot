@@ -150,7 +150,7 @@ def speak_out_loud(text: str) -> None:
                 auth_url = f"{base_url}/auth"
                 create_url = f"{base_url}/createvoice"
 
-                with httpx.Client(timeout=60.0) as client:
+                with httpx.Client(timeout=5.0) as client:
                     client.post(auth_url, json={"key": settings.tts_api_key}).raise_for_status()
                     payload = {
                         "metin": text,
@@ -178,7 +178,7 @@ def speak_out_loud(text: str) -> None:
                 except OSError:
                     pass
             async def _save_mp3():
-                communicate = edge_tts.Communicate(text, "tr-TR-EmelNeural", rate="+25%")
+                communicate = edge_tts.Communicate(text, "tr-TR-AhmetNeural", rate="+25%")
                 await communicate.save(temp_audio)
             asyncio.run(_save_mp3())
 
@@ -231,8 +231,8 @@ async def run_live_mic_test(record_duration: int = 5) -> None:
         logger.info("🧑 Müşteri (Siz Konuştunuz): '%s'", user_text)
 
         # 2. Çıkış kelimesi kontrolü
-        lower_text = user_text.lower()
-        exit_keywords = ["kapat", "iyi günler", "hoşça kal", "çıkış", "bitti", "hayır", "başka isteğim yok", "yok kapat"]
+        lower_text = user_text.replace("İ", "i").replace("I", "ı").lower()
+        exit_keywords = ["kapat", "iyi günler", "hoşça kal", "çıkış", "bitti", "hayır", "başka isteğim yok", "yok", "teşekkür", "sağ ol", "sağol", "görüşürüz", "kolay gelsin"]
         if any(w in lower_text for w in exit_keywords):
             bye_msg = "Bizi aradığınız için teşekkür ederiz. İyi günler dileriz."
             logger.info("🤖 Asistan (Görüşme Sonu) : '%s'", bye_msg)

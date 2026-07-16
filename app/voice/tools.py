@@ -222,18 +222,23 @@ class VoiceToolExecutor:
         if not conversation:
             return {"error": "conversation_not_found"}
 
-        result = await create_appointment(
-            db=db,
-            business=business,
-            customer=customer,
-            conversation=conversation,
-            service=service,
-            staff=staff,
-            start_local=start_time_local,
-            source="voice",
-            created_by="voice_assistant",
-        )
-        return result
+        try:
+            result = await create_appointment(
+                db=db,
+                business=business,
+                customer=customer,
+                conversation=conversation,
+                service=service,
+                staff=staff,
+                start_local=start_time_local,
+                source="voice",
+                created_by="voice_assistant",
+            )
+            logger.info("📅 Randevu API Çağrısı Başarılı: %s", result)
+            return result
+        except Exception as e:
+            logger.error("❌ Randevu API Çağrısı Başarısız: %s", str(e))
+            return {"error": "api_error", "details": str(e)}
 
     @staticmethod
     async def cancel_appointment(appointment_id: str) -> bool:
@@ -245,15 +250,48 @@ class VoiceToolExecutor:
     async def reschedule_appointment(
         business_slug: str,
         appointment_id: str,
-        new_start_local: str
+        new_start_local: str | None = None,
+        new_service_name: str | None = None,
+        new_staff_name: str | None = None
     ) -> dict[str, Any]:
         db = get_db()
         business = await db.businesses.find_one({"business_id": business_slug})
         if not business:
             return {"error": "business_not_found"}
             
+        import difflib
+        
+        # 1. Service eşleşmesi
+        new_service = None
+        if new_service_name and new_service_name != "-":
+            services = await db.services.find({"business_id": business["_id"]}).to_list(100)
+            if services:
+                service_names = [s["name"] for s in services]
+                matches = difflib.get_close_matches(new_service_name, service_names, n=1, cutoff=0.3)
+                if matches:
+                    new_service = next(s for s in services if s["name"] == matches[0])
+            if not new_service:
+                return {"error": "service_not_found"}
+
+        # 2. Personel eşleşmesi
+        new_staff = None
+        if new_staff_name and new_staff_name != "-":
+            staffs = await db.staff.find({"business_id": business["_id"]}).to_list(100)
+            if staffs:
+                first_name = new_staff_name.split()[0].lower()
+                for stf in staffs:
+                    if first_name in stf["name"].lower():
+                        new_staff = stf
+                        break
+            if not new_staff:
+                return {"error": "staff_not_found"}
+                
+        # Zaman '-' gelmişse None yap
+        if new_start_local == "-":
+            new_start_local = None
+
         from app.core.booking import reschedule_appointment
-        return await reschedule_appointment(db, appointment_id, new_start_local, business)
+        return await reschedule_appointment(db, appointment_id, new_start_local, business, new_service, new_staff)
 
     @staticmethod
     async def get_customer_appointments(business_slug: str, customer_phone: str) -> list[dict[str, Any]]:

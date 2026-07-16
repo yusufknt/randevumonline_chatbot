@@ -34,11 +34,7 @@ class AudioSocketServer:
         self.port = port or settings.voice_server_port
         self._server: asyncio.Server | None = None
         self._active_sessions: dict[str, VoiceSession] = {}
-        self._pipeline = None
-
-    def attach_pipeline(self, pipeline: Any) -> None:
-        """STT->LLM->TTS akış yöneticisini sunucuya bağlar."""
-        self._pipeline = pipeline
+        # Pipeline artık her oturum (ID paketi) için ayrı ayrı başlatılacaktır.
 
     async def start(self) -> None:
         """TCP sunucusunu başlatır."""
@@ -47,7 +43,7 @@ class AudioSocketServer:
             self.host,
             self.port,
         )
-        logger.info("AudioSocket Sunucusu başladı -> tcp://%s:%s", self.host, self.port)
+        logger.info("🟢 AudioSocket Sunucusu başladı -> tcp://%s:%s (Asterisk/SIP aramaları için dinleniyor)", self.host, self.port)
 
     async def stop(self) -> None:
         """TCP sunucusunu kapatır ve aktif bağlantıları sonlandırır."""
@@ -64,9 +60,13 @@ class AudioSocketServer:
     ) -> None:
         """Asterisk'ten gelen her bir TCP bağlantısını yöneten işleyici."""
         client_addr = writer.get_extra_info("peername")
-        logger.info("Yeni AudioSocket bağlantısı alındı: %s", client_addr)
+        remote_ip = client_addr[0] if client_addr else "Unknown"
+        remote_port = client_addr[1] if client_addr else "Unknown"
+        
+        logger.info("📞 [Yeni Çağrı] AudioSocket bağlantısı alındı. Remote IP: %s, Remote Port: %s", remote_ip, remote_port)
 
         session: VoiceSession | None = None
+        pipeline = None
 
         try:
             while True:
@@ -82,14 +82,26 @@ class AudioSocketServer:
                     session_id = packet.payload.decode("utf-8", errors="replace")
                     session = VoiceSession(session_id=session_id)
                     self._active_sessions[session_id] = session
-                    logger.info("Oturum kimliği doğrulandı: session_id=%s", session_id)
+                    
+                    # Her oturum için yeni bir pipeline oluştur (Böylece session'a özel durum yönetimi sağlanır)
+                    from app.voice.pipeline import VoicePipeline
+                    pipeline = VoicePipeline(session=session)
+                    
+                    logger.info("✅ Oturum kimliği doğrulandı: session_id=%s", session_id)
 
                 elif packet.packet_type == AudioSocketPacketType.AUDIO:
                     if session:
+                        if session.total_audio_frames_received == 0:
+                            logger.info("▶️ Ses paketi alınmaya başlandı. (Session: %s)", session.session_id)
+                            
                         session.total_audio_frames_received += 1
+                        # İlk birkaç pakette log yazdıralım (spam olmaması için modulo kullanabiliriz)
+                        if session.total_audio_frames_received % 150 == 1:
+                            logger.debug("🔊 RTP/AudioSocket ses alınıyor... (Paket: %s)", session.total_audio_frames_received)
+
                         # Eğer STT/LLM/TTS akışı aktifse pipeline çalıştır, değilse echo ile devam et
-                        if hasattr(self, "_pipeline") and self._pipeline:
-                            await self._pipeline.handle_incoming_audio(
+                        if pipeline:
+                            await pipeline.handle_incoming_audio(
                                 packet.payload,
                                 lambda chunk: self.send_audio(writer, chunk),
                             )
@@ -102,16 +114,18 @@ class AudioSocketServer:
                     break
 
         except asyncio.CancelledError:
-            logger.info("Bağlantı iptal edildi: %s", client_addr)
-        except Exception:
-            logger.exception("İstemci işlenirken beklenmeyen hata: %s", client_addr)
+            logger.info("⚠️ Bağlantı iptal edildi (Remote: %s:%s)", remote_ip, remote_port)
+        except ConnectionResetError:
+            logger.warning("🔌 İstemci bağlantıyı zorla kapattı (TCP Reset). (Remote: %s:%s)", remote_ip, remote_port)
+        except Exception as e:
+            logger.exception("❌ İstemci işlenirken beklenmeyen hata oluştu (Sunucu çökmeyecek): %s:%s - Hata: %s", remote_ip, remote_port, str(e))
         finally:
             if session and session.session_id in self._active_sessions:
                 session.update_state(SessionState.CLOSED)
                 del self._active_sessions[session.session_id]
             writer.close()
             await writer.wait_closed()
-            logger.info("Bağlantı kapatıldı: %s", client_addr)
+            logger.info("🛑 Bağlantı tamamen kapatıldı (Çağrı sonlandı): %s:%s", remote_ip, remote_port)
 
     @staticmethod
     async def _read_packet(reader: asyncio.StreamReader) -> AudioSocketPacket | None:
@@ -121,7 +135,11 @@ class AudioSocketServer:
         except asyncio.IncompleteReadError:
             return None
 
-        packet_type_raw, length = struct.unpack("!BH", header)
+        try:
+            packet_type_raw, length = struct.unpack("!BH", header)
+        except struct.error as e:
+            logger.error("Bozuk paket başlığı ayrıştırılamadı (struct.error): %s", str(e))
+            return None
 
         try:
             packet_type = AudioSocketPacketType(packet_type_raw)
@@ -132,7 +150,7 @@ class AudioSocketServer:
         try:
             payload = await reader.readexactly(length)
         except asyncio.IncompleteReadError:
-            logger.error("Eksik veri yükü (payload) okundu")
+            logger.error("Eksik veri yükü (payload) okundu. Beklenen: %s bytes", length)
             return None
 
         return AudioSocketPacket(packet_type=packet_type, payload=payload)

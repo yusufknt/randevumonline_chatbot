@@ -28,7 +28,10 @@ services:
       - ./flow.json:/code/flow.json
     depends_on:
       - mongodb
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    # Production için:
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    # Geliştirme (Lokal) için yukarıdakini yoruma alıp aşağıdakini açabilirsiniz:
+    # command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 
 volumes:
   mongodb_data:

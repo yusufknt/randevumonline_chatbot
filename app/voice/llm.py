@@ -23,30 +23,32 @@ logger = logging.getLogger(__name__)
 VOICE_SYSTEM_PROMPT = """Sen {business_name} sesli asistanısın. Müşterilerle telefonda en kısa, net ve anlaşılır şekilde konuşursun.
 Gereksiz uzatmalardan kaçın. En fazla 1-2 kısa cümle kur. Bugünün tarihi: {today_date}.
 DİKKAT (ÇOK ÖNEMLİ): Konuşmalarında ASLA markdown (yıldız, alt çizgi vb.) kullanma. Sayıları, fiyatları, tarihleri ve saatleri bir insanın telefonda söyleyeceği gibi, tamamen okunduğu gibi doğal bir konuşma diliyle yaz (örn: "15:00" yerine "öğleden sonra üç" veya "saat on beş", "250 TL" yerine "iki yüz elli lira", "15.07.2026" yerine "on beş temmuz"). Müşteriye karşı son derece doğal, gerçekçi ve akıcı bir telefon görüşmesi yapıyormuş gibi davran.
+Müşterinin Mevcut Randevuları:
+{user_appointments}
 
 Diyalog Akışı SIKICA ŞU SIRAYLA OLMALIDIR:
 1. ADIM: Personel Seçimi: Müşteriye ilk olarak hangi ustayı ({staff_list}) tercih ettiğini sor. (Müşteri usta söylemeden asla devam etme).
 2. ADIM: Gün Bilgisi: Usta seçildikten sonra "Hangi gün randevu istersiniz?" diye sor.
-3. ADIM: Saat Seçimi (MÜSAİTLİK SORGULAMA): Müşteri usta ve GÜN seçtiğinde, o günkü müsait saatleri öğrenmek zorundasın. Bunun için metnin sonuna GİZLİ şu kodu ekle:
-[KONTROL: Usta Adı | YYYY-MM-DD]
-(Örnek: "15 Temmuz için müsaitlik durumuna hemen bakıyorum... [KONTROL: Mehmet Kaya | 2026-07-15]")
-Sistem sana boş saatleri gizlice verecek. Sistemden saatler geldiğinde müşteriye saatleri okurken KISALT (Örn: "9:00, 10:00, 11:00, 12:00" yerine "9'dan 12'ye kadar boş" şeklinde blok halinde söyle) ve hangi saati seçtiğini sor.
-4. ADIM: Hizmet Seçimi: Müşteri saati seçtikten SONRA, "Hangi hizmeti almak istersiniz?" diye sor. (Müşteri "saç" derse, elindeki [{services_list}] listesinden saçla ilgili olanları filtreleyerek netleştir).
-5. ADIM: Randevu Onayı: Müşteri her şeyi seçtiğinde işlemi onayla ve metnin sonuna ASLA OKUNMAYACAK şu gizli kodu ekle:
-[RANDEVU: Usta Adı | Hizmet Adı | YYYY-MM-DD HH:MM]
-DİKKAT: Randevuyu onayladıktan sonra müşteriye MUTLAKA "Başka bir isteğiniz var mı?" diye sor.
-Örnek: Randevunuzu oluşturdum, başka bir isteğiniz var mı? [RANDEVU: Yusuf Demir | Saç Kesimi | 2026-07-15 14:30]
+3. ADIM: Müsaitlik Kontrolü: Müşteri usta ve GÜN seçtiğinde, o günkü müsait saatleri öğrenmek zorundasın. Bunun için SADECE kendi kendine şu özel etiketi oluştur ve müşteriye HİÇBİR ŞEY SÖYLEME (cevap metnin sadece bu etiket olsun):
+   [KONTROL: Usta Adı | YYYY-MM-DD | Belirsiz]
+   Örnek: [KONTROL: Yusuf | 2026-07-15 | Belirsiz] (Hizmet daha sorulmadığı için 3. parametreye Belirsiz yaz).
+   Bu etiketi gönderdiğinde sistem sana o günün boş saatlerini döndürecek.
+4. ADIM: Saat Seçimi: Sistem sana boş saatleri verdiğinde, müşteriye "Şu saatler boş: 10:00, 11:30. Hangisi uygun?" diye sor.
+5. ADIM: Hizmet Seçimi: Müşteri saatini seçtikten sonra, randevuyu kaydetmeden önce "Hangi hizmeti almak istersiniz? Örneğin {services_list}." diye sor.
+6. ADIM: Randevu Onayı: Müşteri hizmeti de seçtiğinde, işlemi onaylamak için KESİNLİKLE şu özel etiketi kullan:
+   [RANDEVU: YYYY-MM-DD HH:MM | Usta Adı | Hizmet Adı | Müşteri Adı]
+   Örnek: [RANDEVU: 2026-07-15 10:00 | Yusuf | Saç Kesimi | Ahmet]
 
-İPTAL VE REVİZE İŞLEMLERİ:
-Müşterinin sistemdeki aktif randevuları şunlardır:
-[{user_appointments}]
 Eğer müşteri var olan bir randevusunu İPTAL ETMEK isterse:
-Hangi randevuyu iptal edeceğinden emin olduktan sonra cevabının en sonuna ŞU KODU KESİNLİKLE EKLE (eklemezsen iptal olmaz!): [IPTAL: Randevu_ID]
+Cevabının en sonuna ŞU KODU KESİNLİKLE EKLE: [IPTAL: Randevu_ID]
+(Sistem sana ID'leri mesaj geçmişinde verecek).
 
-Eğer müşteri var olan bir randevusunu REVİZE ETMEK (saatini değiştirmek) isterse:
-1. Önce [KONTROL: Usta Adı | Yeni Tarih] etiketiyle yeni saatin müsaitliğine bak.
-2. Müşteri boş saatlerden birini seçtiğinde, cevabının en sonuna ŞU KODU KESİNLİKLE EKLE (eklemezsen revize olmaz!): [REVIZE: Randevu_ID | YYYY-MM-DD HH:MM]
-Örnek: Randevunuzu revize ettim, başka bir isteğiniz var mı? [REVIZE: 6a50ef... | 2026-07-15 14:30]
+Eğer müşteri var olan bir randevusunu REVİZE ETMEK (saatini, gününü, ustasını veya hizmetini değiştirmek) isterse:
+1. Önce [KONTROL: Yeni Usta Adı | Yeni Tarih | Yeni Hizmet] etiketiyle müsaitliğe bak (Değişmeyenlere - koyabilirsin).
+2. Müşteri boş saatlerden birini seçtiğinde (veya sadece usta/hizmet değişiyorsa hemen), cevabının en sonuna ŞU KODU KESİNLİKLE EKLE: 
+[REVIZE: Randevu_ID | YYYY-MM-DD HH:MM | Yeni_Usta_Adı | Yeni_Hizmet_Adı]
+NOT: Eğer bir bilgi (örneğin usta veya saat) DEĞİŞMİYORSA yerine "-" (tire) koy.
+Örnek: [REVIZE: 6a50ef... | 2026-07-15 14:30 | - | Sakal Tıraşı] veya [REVIZE: 6a50ef... | - | Mehmet | -]
 """
 
 
@@ -127,6 +129,36 @@ def parse_target_date_tr(text: str) -> tuple[date, str]:
     return today + timedelta(days=1), "Yarın"
 
 
+def normalize_turkish_text(text: str) -> str:
+    """TTS motorunun saat, tarih ve paraları düzgün okuması için metni düzenler."""
+    import re
+    # 1. Markdown temizliği
+    text = re.sub(r"[*_`]", "", text)
+    # 2. Fiyat temizliği (250 TL -> 250 lira)
+    text = re.sub(r"(\d+)\s*(TL|tl|Tl)\b", r"\1 lira", text)
+    # 3. Saat formatı (15:00 -> saat 15, 15:30 -> 15 buçuk)
+    def time_repl(match):
+        hour = int(match.group(1))
+        minute = int(match.group(2))
+        if minute == 0:
+            return f"saat {hour}"
+        elif minute == 30:
+            return f"{hour} buçuk"
+        else:
+            return f"{hour} {minute}"
+    text = re.sub(r"\b(\d{1,2}):(\d{2})\b", time_repl, text)
+    # 4. Tarih formatı (15.07.2026 -> 15 Temmuz)
+    def date_repl(match):
+        d = int(match.group(1))
+        m = int(match.group(2))
+        months = ["", "Ocak", "Şubat", "Mart", "Nisan", "Mayıs", "Haziran", "Temmuz", "Ağustos", "Eylül", "Ekim", "Kasım", "Aralık"]
+        if 1 <= m <= 12:
+            return f"{d} {months[m]}"
+        return match.group(0)
+    text = re.sub(r"\b(\d{1,2})\.(\d{1,2})\.\d{4}\b", date_repl, text)
+    return text
+
+
 class VoiceLLMEngine:
     """Sesli aramalar için LLM diyalog yöneticisi."""
 
@@ -200,14 +232,14 @@ class VoiceLLMEngine:
                 elapsed_s,
                 self.turn_count,
             )
-            return self.voice_settings.voice_timeout_message
+            return normalize_turkish_text(self.voice_settings.voice_timeout_message)
 
         self.history.append({"role": "user", "content": user_text})
 
         # DeepSeek veya Groq API Anahtarı Kontrolü
         api_key = self.voice_settings.deepseek_api_key or self.settings.groq_api_key
         if not api_key:
-            return await self._fallback_simulated_response(user_text)
+            return normalize_turkish_text(await self._fallback_simulated_response(user_text))
 
         # DeepSeek öncelikli yapılandırma seçimi
         if self.voice_settings.deepseek_api_key:
@@ -243,12 +275,13 @@ class VoiceLLMEngine:
                     import re
                     
                     # 1. KONTROL ETİKETİNİ YAKALA (Müsaitlik Sorgusu)
-                    kontrol_match = re.search(r"\[KONTROL:\s*([^|]+)\|\s*([^\]]+)\]", assistant_text)
+                    kontrol_match = re.search(r"\[KONTROL:\s*([^|]+)\|\s*([^|]+)(?:\|\s*([^\]]+))?\]", assistant_text)
                     if kontrol_match:
                         staff_name = kontrol_match.group(1).strip()
                         date_str = kontrol_match.group(2).strip()
+                        service_name = kontrol_match.group(3).strip() if kontrol_match.group(3) else "Belirsiz"
                         
-                        logger.info("🔍 LLM Müsaitlik Sorgusu Tetikledi! Usta: %s, Tarih: %s", staff_name, date_str)
+                        logger.info("🔍 LLM Müsaitlik Sorgusu Tetikledi! Usta: %s, Tarih: %s, Hizmet: %s", staff_name, date_str, service_name)
                         
                         # Gizli etiketi metinden çıkar
                         clean_text = assistant_text.replace(kontrol_match.group(0), "").strip()
@@ -257,9 +290,8 @@ class VoiceLLMEngine:
                             
                         self.history.append({"role": "assistant", "content": clean_text})
                         
-                        # Veritabanından saatleri çek (check_availability parametre sırası: business, service, date, staff)
-                        # Hizmet henüz belli olmadığı için service_name="Belirsiz" gönderiyoruz.
-                        avail = await VoiceToolExecutor.check_availability(self.business_slug, "Belirsiz", date_str, staff_name)
+                        # Veritabanından saatleri çek
+                        avail = await VoiceToolExecutor.check_availability(self.business_slug, service_name, date_str, staff_name)
                         if "error" in avail:
                             sys_msg = f"SİSTEM BİLGİSİ: Hata oluştu ({avail['error']}). Müşteriye başka bir tarih seçmesini veya usta/hizmet uyuşmazlığı olduğunu söyle."
                         else:
@@ -270,11 +302,12 @@ class VoiceLLMEngine:
                         continue  # 2. tura dön ve saatlerle birlikte yeni cevabı al!
 
                     # 2. RANDEVU GİZLİ ETİKETİNİ YAKALA VE VERİTABANINA KAYDET
-                    match = re.search(r"\[RANDEVU:\s*([^|]+)\|\s*([^|]+)\|\s*([^\]]+)\]", assistant_text)
+                    match = re.search(r"\[RANDEVU:\s*([^|]+)\|\s*([^|]+)\|\s*([^|]+)\|\s*([^\]]+)\]", assistant_text)
                     if match:
-                        staff_name = match.group(1).strip()
-                        service_name = match.group(2).strip()
-                        datetime_str = match.group(3).strip()
+                        datetime_str = match.group(1).strip()
+                        staff_name = match.group(2).strip()
+                        service_name = match.group(3).strip()
+                        customer_name = match.group(4).strip()
                         
                         logger.info("📅 LLM Randevu Oluşturma Tetiklendi! Usta: %s, Hizmet: %s, Zaman: %s", staff_name, service_name, datetime_str)
                         
@@ -282,22 +315,15 @@ class VoiceLLMEngine:
                             business_slug=self.business_slug,
                             service_name=service_name,
                             staff_name=staff_name,
-                            customer_phone="+905321112233",  # Sesli asistan arayan numarayı normalde dışarıdan alır
-                            customer_name="Sesli Müşteri",
+                            customer_phone="+905321112233",
+                            customer_name=customer_name,
                             start_time_local=datetime_str,
                         )
                         
                         if "error" in result:
                             err = result["error"]
                             logger.error("Randevu oluşturma hatası: %s", err)
-                            if err == "staff_cannot_perform_service":
-                                assistant_text = f"Özür dilerim, ancak {staff_name} ustamız {service_name} işlemini yapmıyor. Lütfen diğer ustamızı veya farklı bir hizmeti tercih edebilir misiniz?"
-                            elif err == "slot_taken":
-                                assistant_text = f"Üzgünüm, seçtiğiniz o saat az önce dolmuş. Lütfen farklı bir saat söyler misiniz?"
-                            elif err == "staff_not_found" or err == "service_not_found":
-                                assistant_text = f"Maalesef hizmet veya usta eşleşmedi. Lütfen tekrar eder misiniz?"
-                            else:
-                                assistant_text = f"Sistemde bir hata oluştu, randevuyu kaydedemedim. Lütfen tekrar deneyin."
+                            assistant_text = f"Sistemde bir hata oluştu ({err}), randevuyu kaydedemedim. Lütfen tekrar deneyin."
                         else:
                             logger.info("✅ Randevu başarıyla veritabanına işlendi (ID: %s)", result.get("appointment_id"))
                             assistant_text = assistant_text.replace(match.group(0), "").strip()
@@ -315,19 +341,28 @@ class VoiceLLMEngine:
                             logger.info("✅ Randevu iptal edildi (ID: %s)", apt_id)
                             assistant_text = assistant_text.replace(iptal_match.group(0), "").strip()
                             
-                    # 4. REVİZE GİZLİ ETİKETİNİ YAKALA VE VERİTABANINA KAYDET
-                    revize_match = re.search(r"\[REVIZE:\s*([^|]+)\|\s*([^\]]+)\]", assistant_text)
+                    # 4. REVIZE (Randevu Yeniden Planlama / Hizmet-Usta Değişimi) İşleme
+                    revize_match = re.search(r"\[REVIZE:\s*([^|]+)\|\s*([^|]+)\|\s*([^|]+)\|\s*([^\]]+)\]", assistant_text)
                     if revize_match:
                         apt_id = revize_match.group(1).strip()
-                        new_start = revize_match.group(2).strip()
-                        logger.info("🔄 LLM Randevu Revizesi Tetiklendi! ID: %s, Yeni Zaman: %s", apt_id, new_start)
+                        new_date_str = revize_match.group(2).strip()
+                        new_staff_name = revize_match.group(3).strip()
+                        new_service_name = revize_match.group(4).strip()
                         
-                        result = await VoiceToolExecutor.reschedule_appointment(self.business_slug, apt_id, new_start)
+                        logger.info("🔄 LLM Randevu Revizesi Tetiklendi! ID: %s, Yeni Zaman: %s, Usta: %s, Hizmet: %s", apt_id, new_date_str, new_staff_name, new_service_name)
+                        
+                        result = await VoiceToolExecutor.reschedule_appointment(
+                            self.business_slug, 
+                            apt_id, 
+                            new_date_str,
+                            new_service_name,
+                            new_staff_name
+                        )
                         if "error" in result:
                             err = result["error"]
                             logger.error("Randevu revize hatası: %s", err)
                             if err == "slot_taken":
-                                assistant_text = "Üzgünüm, seçtiğiniz o saat az önce dolmuş. Lütfen farklı bir saat söyler misiniz?"
+                                assistant_text = "Üzgünüm, seçtiğiniz o saat az önce dolmuş veya ustanın başka bir randevusuyla çakışıyor. Lütfen farklı bir saat seçer misiniz?"
                             else:
                                 assistant_text = "Sistemde bir hata oluştu, randevunuzu değiştiremedim. Lütfen tekrar deneyin."
                         else:
@@ -335,17 +370,17 @@ class VoiceLLMEngine:
                             assistant_text = assistant_text.replace(revize_match.group(0), "").strip()
                     
                     self.history.append({"role": "assistant", "content": assistant_text})
-                    return (aggregated_assistant_text + assistant_text).strip()
+                    return normalize_turkish_text((aggregated_assistant_text + assistant_text).strip())
 
         except Exception as exc:
             logger.warning("LLM isteği başarısız oldu: %s", exc)
-            return await self._fallback_simulated_response(user_text)
+            return normalize_turkish_text(await self._fallback_simulated_response(user_text))
 
     async def _fallback_simulated_response(self, user_text: str) -> str:
         """API anahtarı olmadığında konuşma hafızasıyla gün/saat/usta algılayıp veritabanı sorguları çalıştırır."""
         import re
 
-        lower_text = user_text.lower()
+        lower_text = user_text.replace("İ", "i").replace("I", "ı").lower()
         if any(w in lower_text for w in ["kapat", "iyi günler", "hoşça kal", "teşekkür"]):
             return "Bizi aradığınız için teşekkür ederiz. İyi günler dileriz."
 

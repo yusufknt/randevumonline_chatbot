@@ -197,8 +197,10 @@ async def cancel_appointment(
 async def reschedule_appointment(
     db: AsyncIOMotorDatabase,
     appointment_id: str,
-    new_start_local: str,
-    business: dict
+    new_start_local: str | None,
+    business: dict,
+    new_service: dict | None = None,
+    new_staff: dict | None = None,
 ) -> dict:
     from bson.objectid import ObjectId
     try:
@@ -211,37 +213,56 @@ async def reschedule_appointment(
         return {"error": "appointment_not_found"}
 
     tz = business.get("timezone", "Europe/Istanbul")
-    try:
-        new_start_utc = _parse_local(new_start_local, tz)
-    except ValueError:
-        return {"error": "invalid_start_time"}
+    
+    # Yeni zaman
+    target_start_utc = apt["start_time"]
+    if new_start_local:
+        try:
+            target_start_utc = _parse_local(new_start_local, tz)
+        except ValueError:
+            return {"error": "invalid_start_time"}
+            
+    # Yeni personel
+    target_staff_id = new_staff["_id"] if new_staff else apt["staff_id"]
+    
+    # Yeni hizmet
+    service_doc = apt["services"][0]
+    if new_service:
+        service_doc = {
+            "service_id": new_service["_id"],
+            "name": new_service["name"],
+            "duration_minutes": int(new_service["duration_minutes"]),
+            "price": _to_money_decimal128(new_service["price"]),
+        }
         
-    duration = apt["services"][0]["duration_minutes"]
-    new_end_utc = new_start_utc + timedelta(minutes=duration)
+    duration = service_doc["duration_minutes"]
+    target_end_utc = target_start_utc + timedelta(minutes=duration)
 
     # Atomik çakışma kontrolü (Kendi ID'si hariç)
     conflict = await db.appointments.find_one({
         "business_id": apt["business_id"],
-        "staff_id": apt["staff_id"],
+        "staff_id": target_staff_id,
         "_id": {"$ne": oid},
         "status": {"$in": ["pending", "confirmed"]},
-        "start_time": {"$lt": new_end_utc},
-        "end_time": {"$gt": new_start_utc},
+        "start_time": {"$lt": target_end_utc},
+        "end_time": {"$gt": target_start_utc},
     })
     if conflict:
         return {"error": "slot_taken"}
 
-    await db.appointments.update_one(
-        {"_id": oid},
-        {"$set": {
-            "start_time": new_start_utc,
-            "end_time": new_end_utc,
-            "updated_at": datetime.now(timezone.utc)
-        }}
-    )
+    update_data = {
+        "start_time": target_start_utc,
+        "end_time": target_end_utc,
+        "staff_id": target_staff_id,
+        "services": [service_doc],
+        "total_price": service_doc["price"],
+        "updated_at": datetime.now(timezone.utc)
+    }
+
+    await db.appointments.update_one({"_id": oid}, {"$set": update_data})
 
     return {
         "status": "rescheduled",
         "appointment_id": appointment_id,
-        "new_start_local": local_iso(new_start_utc, tz)
+        "new_start_local": local_iso(target_start_utc, tz)
     }

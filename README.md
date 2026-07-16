@@ -110,7 +110,40 @@ WhatsApp Cloud API                 Instagram Graph API
   /webhooks/whatsapp/flow                  │
   (şifreli data_exchange)        core.ai (Groq) + core.tools ──► MongoDB (oku)
         │                                  │
-        └─► booking.create_appointment ─► MongoDB ◄── booking_url (web sitesi)
+         └─► booking.create_appointment ─► MongoDB ◄── booking_url (web sitesi)
+
+### Sesli Asistan (NetGSM SIP -> Asterisk -> AudioSocket) Mimarisi
+
+```
+Telefon Çağrısı
+        │
+        ▼
+   Netgsm SIP Trunk
+        │ (UDP/RTP)
+        ▼
+ Asterisk / PBX Sunucusu (Gelen Çağrıyı Karşılar)
+        │
+        ▼ (TCP AudioSocket Port 8010)
+  FastAPI app/main.py -> AudioSocketServer
+        │
+        ▼
+  STT -> LLM -> TTS (Pipeline)
+```
+
+**NetGSM Test Adımları:**
+1. Sunucu üzerinde projeyi güncelleyin ve başlatın: 
+   ```bash
+   git pull && docker-compose up -d --build
+   ```
+2. Asterisk veya kullandığınız SIP sunucunuzun Netgsm trunk ayarlarını yapın.
+3. Asterisk `extensions.conf` üzerinden gelen çağrıları `AudioSocket` ile `tcp://<SUNUCU-IP>:8010` adresine yönlendirin.
+4. Netgsm numaranızı aradığınızda çağrı Asterisk üzerinden Python uygulamasına ulaşacak, terminal loglarında `"📞 [Yeni Çağrı] AudioSocket bağlantısı alındı"` kaydını göreceksiniz.
+5. Bot ile konuşarak sesli test yapabilirsiniz. Lokal mikrofon testi olan `test_voice_live_mic.py` artık sadece geliştirme sırasında opsiyonel olarak kullanılmaktadır.
+
+**Sorun Giderme (Troubleshooting):**
+- **Health Check:** Botun genel sağlık durumunu `curl http://localhost:8000/health` adresiyle kontrol edebilirsiniz. SIP portunun dinlenip dinlenmediği, LLM, STT ve TTS bağlantı durumları bu JSON çıktısında görülür.
+- **Çağrı Düşmesi / Ses Gelmemesi:** Netgsm -> Asterisk arasındaki UDP/RTP portlarının Firewall (iptables/ufw) üzerinde açık olduğundan emin olun. Ayrıca Asterisk -> Python arasındaki TCP 8010 portunun erişilebilir olduğunu kontrol edin.
+- **Geç Yanıt Verme (Timeout):** LLM (Groq/DeepSeek) API'lerinde anlık yavaşlık olursa sistem otomatik olarak "Sistemde geçici bir yoğunluk var" anonsu okur ve kapanmaz. Kalıcı yavaşlıkta API limitlerini veya ağ bağlantınızı kontrol edin.
 ```
 
 Detay: [`docs/04-whatsapp-flow.md`](docs/04-whatsapp-flow.md).
