@@ -130,6 +130,10 @@ Telefon Çağrısı
   STT -> LLM -> TTS (Pipeline)
 ```
 
+**Voice Bot (Sesli Asistan) Özellikleri:**
+- **Zero-Delay Startup (Sıfır Gecikmeli Karşılama)**: Çağrı açıldığı an, herhangi bir LLM veya TTS işlemini beklemeden `app/voice/assets/greeting.alaw` üzerinden hazır karşılama anonsu çalınır. Bu sayede bekleme süreleri tamamen ortadan kalkar. Dosya bulunamazsa otomatik olarak eski modele (Dinamik TTS) döner.
+- **Half-Duplex (Telsiz) Modu**: Asistan konuşurken arka plan gürültüsüyle yanlışlıkla sözünün kesilmesini önlemek için, asistan konuşmasını tamamen bitirmeden mikrofondan gelen ses paketleri yoksayılır.
+
 **NetGSM Test Adımları:**
 1. Sunucu üzerinde projeyi güncelleyin ve başlatın: 
    ```bash

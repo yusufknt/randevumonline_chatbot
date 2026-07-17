@@ -17,8 +17,9 @@ RUN pip install --no-cache-dir --upgrade pip && \
 # Uygulama kodlarını kopyala
 COPY . .
 
-# FastAPI (8000) ve AudioSocket Ses Sunucusu (8010) portları
-EXPOSE 8000 8010
-
+# FastAPI (8000) ve SIP UDP Sunucusu (8010) portları
+EXPOSE 8000
+EXPOSE 8010/udp
+EXPOSE 10000-10100/udp
 # Uygulamayı başlat
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

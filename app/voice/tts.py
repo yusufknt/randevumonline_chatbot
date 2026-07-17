@@ -102,7 +102,7 @@ class TextToSpeechEngine:
         try:
             subprocess.run([
                 "ffmpeg", "-y", "-i", audio_path,
-                "-f", "s16le", "-ar", str(self.sample_rate), "-ac", "1",
+                "-f", "alaw", "-ar", "8000", "-ac", "1",
                 raw_path
             ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
@@ -136,7 +136,7 @@ class TextToSpeechEngine:
 
             subprocess.run([
                 "ffmpeg", "-y", "-i", mp3_path,
-                "-f", "s16le", "-ar", str(self.sample_rate), "-ac", "1",
+                "-f", "alaw", "-ar", "8000", "-ac", "1",
                 raw_path
             ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 

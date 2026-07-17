@@ -17,10 +17,16 @@ class VoiceSettings(BaseSettings):
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
-    # AudioSocket Sunucu Ayarları
+    # SIP Sunucu Ayarları
     voice_server_host: str = "0.0.0.0"
     voice_server_port: int = 8010
-    voice_sample_rate: int = 8000  # Asterisk varsayılan olarak 8kHz PCM akıtır
+    voice_external_ip: str | None = None
+    
+    # RTP Sunucu Ayarları
+    rtp_start_port: int = 10000
+    rtp_end_port: int = 10100
+    
+    voice_sample_rate: int = 8000  # 8kHz
     voice_frame_size: int = 320    # 20ms @ 8kHz, 16-bit PCM = 320 bayt
 
     # Oturum Zaman Aşımı ve Gecikme Sınırları

@@ -59,13 +59,45 @@ class VoiceToolExecutor:
         return [str(s["name"]) for s in staff_members if "name" in s]
 
     @staticmethod
-    async def get_services(business_slug: str) -> list[str]:
+    async def get_services(business_slug: str, staff_name: str | None = None, return_detailed_string: bool = False) -> list[str] | str:
         """İşletmeye ait aktif hizmet/kategori isimlerini veritabanından getirir."""
         db = get_db()
         business = await db.businesses.find_one({"business_id": business_slug})
         if not business:
-            return []
+            return [] if not return_detailed_string else ""
+            
         services = await db.services.find({"business_id": business["_id"]}).to_list(100)
+        staffs = await db.staff.find({"business_id": business["_id"]}).to_list(100)
+        
+        # Sadece belirli bir personelin hizmetlerini istiyorsak
+        if staff_name:
+            staff_doc = None
+            first_name = staff_name.split()[0].lower()
+            for stf in staffs:
+                if first_name in stf["name"].lower():
+                    staff_doc = stf
+                    break
+            
+            if staff_doc and "service_ids" in staff_doc:
+                staff_service_ids = [str(sid) for sid in staff_doc["service_ids"]]
+                filtered_services = [str(s["name"]) for s in services if "name" in s and str(s["_id"]) in staff_service_ids]
+                return filtered_services if filtered_services else [str(s["name"]) for s in services if "name" in s]
+                
+        # Detaylı bir string isteniyorsa (System Prompt için: Usta1: x, y | Usta2: z, w)
+        if return_detailed_string:
+            staff_mapping = []
+            for stf in staffs:
+                stf_name = stf["name"].split()[0]
+                if "service_ids" in stf:
+                    s_ids = [str(sid) for sid in stf["service_ids"]]
+                    s_names = [str(s["name"]) for s in services if str(s["_id"]) in s_ids]
+                    if s_names:
+                        staff_mapping.append(f"{stf_name} ustanın yaptığı işlemler: {', '.join(s_names)}")
+            if staff_mapping:
+                return " | ".join(staff_mapping)
+            else:
+                return ", ".join([str(s["name"]) for s in services if "name" in s])
+                
         return [str(s["name"]) for s in services if "name" in s]
 
     @staticmethod

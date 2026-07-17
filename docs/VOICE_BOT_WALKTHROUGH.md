@@ -36,8 +36,9 @@ Tüm sesli asistan mimarisi clean code prensiplerine uygun şekilde **`app/voice
 | **`stt.py`** | Sesi Yazıya Çevirme (STT) | Konuşma bitişi algılama (VAD) ve Türkçe transkripsiyon motoru. |
 | **`llm.py`** | Yapay Zeka Konuşma Motoru | Çok turlu diyalog geçmişi (`history`), dinamik saat yakalayıcı (`regex`) ve veritabanı çakışma engelleyici. |
 | **`tools.py`** | Veritabanı Araç Katmanı | `check_availability` ve `book_appointment` ile doğrudan gerçek MongoDB bağlamı. |
-| **`tts.py`** | Metinden Sese Dönüştürme (TTS) | Edge Neural TTS (`tr-TR-EmelNeural`) ile Windows/Mac/Linux platformlarında birebir aynı Türkçe doğal ses. |
-| **`pipeline.py`** | Uçtan Uca Boru Hattı | STT $\rightarrow$ LLM $\rightarrow$ TTS senkronizasyonu ve çift yönlü akış yönetimi. |
+| **`tts.py`** | Metinden Sese Dönüştürme (TTS) | Ses API'si, Edge Neural TTS ve Piper TTS fallback desteği ile Türkçe doğal ses. |
+| **`pipeline.py`** | Uçtan Uca Boru Hattı | STT $\rightarrow$ LLM $\rightarrow$ TTS senkronizasyonu ve Half-Duplex akış yönetimi. |
+| **`rtp_server.py`** | UDP RTP Sunucusu | Asenkron SIP sinyalleşmesi, VAD enerji hesabı ve Zero-Delay hazır ses oynatıcısı. |
 
 ---
 
@@ -70,7 +71,23 @@ Sesli asistan sadece tek bir ustayı değil, işletmedeki farklı personelleri a
 
 ---
 
-## 4. Test ve İzleme Araçları
+## 4. İleri Düzey İletişim Özellikleri
+
+### 4.1 Zero-Delay Startup (Sıfır Gecikmeli Karşılama)
+Gelen aramaların ilk saniyelerinde yaşanabilecek sessizlik (dead-air) problemini ortadan kaldırmak için, önceden sentezlenmiş statik bir ses dosyası (`app/voice/assets/greeting.alaw`) kullanılır. 
+- Telefon açılır açılmaz LLM veya TTS süreçleri beklenmeden doğrudan RTP üzerinden bu ses oynatılır.
+- Oynatma sırasında arka planda asistan modülleri hazırlanır.
+- Eğer ses dosyası bulunamazsa, sistem dinamik olarak LLM->TTS (On-the-fly) karşılama modeline kusursuz bir şekilde geri döner (Fallback).
+
+### 4.2 Half-Duplex (Telsiz) Konuşma Modu
+Asistan konuşurken müşterinin ortamındaki gürültüler (Barge-in / Söz Kesme) nedeniyle asistanın cümlesini yarıda kesmesi engellenmiştir.
+- Asistan `SPEAKING` durumundayken gelen müşteri ses paketleri kasıtlı olarak yoksayılır.
+- Asistan konuşmasını tamamladığı an `LISTENING` moduna geçer ve mikrofon tam kapasiteyle açılır.
+- Bu sayede kesintili diyalogların ve hatalı algılamaların önüne geçilmiş, tıpkı bir insanla telsiz görüşmesi yapılıyormuş gibi stabil bir akış elde edilmiştir.
+
+---
+
+## 5. Test ve İzleme Araçları
 
 ### 4.1 Canlı Sesli Görüşme Testi
 Terminal üzerinden canlı mikrofon ve hoparlörle test başlatmak için:
@@ -117,4 +134,6 @@ docker exec randevum_api python -m scripts.show_db
 ```bash
 python3 -m scripts.test_voice_live_mic
 docker exec randevum_api python -m scripts.show_db
+#.venv/bin/python3 -m scripts.show_db
+
 ```

@@ -59,20 +59,38 @@ class SpeechToTextEngine:
             from faster_whisper import WhisperModel  # type: ignore
 
             if self._whisper_model is None:
-                logger.info("faster-whisper modeli yükleniyor (large-v3-turbo)...")
-                self._whisper_model = WhisperModel("large-v3-turbo", device="cpu", compute_type="int8")
+                logger.info("faster-whisper modeli yükleniyor (small)...")
+                self._whisper_model = WhisperModel("small", device="cpu", compute_type="int8")
 
-            # PCM bytes 16-bit int -> float32 dönüştürme logic'i
-            import numpy as np  # type: ignore
-            audio_array = np.frombuffer(pcm_audio, dtype=np.int16).astype(np.float32) / 32768.0
+            import tempfile
+            import wave
+            import os
 
-            segments, _ = self._whisper_model.transcribe(
-                audio_array,
-                language="tr",
-                vad_filter=True,
-            )
-            text = " ".join(segment.text.strip() for segment in segments)
-            return text
+            # Whisper 16kHz bekler. Biz 8kHz pcm kullanıyoruz. 
+            # wave dosyasına yazıp verirsek, Whisper otomatik olarak 16kHz'e resample eder.
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_f:
+                tmp_path = tmp_f.name
+                
+            try:
+                with wave.open(tmp_path, "wb") as wav_file:
+                    wav_file.setnchannels(1)
+                    wav_file.setsampwidth(2) # 16-bit
+                    wav_file.setframerate(self.sample_rate) # 8000 Hz
+                    wav_file.writeframes(pcm_audio)
+                    
+                segments, _ = self._whisper_model.transcribe(
+                    tmp_path,
+                    language="tr",
+                    vad_filter=True,
+                )
+                text = " ".join(segment.text.strip() for segment in segments)
+                return text
+            finally:
+                if os.path.exists(tmp_path):
+                    try:
+                        os.remove(tmp_path)
+                    except OSError:
+                        pass
         except ImportError:
             # faster_whisper veya numpy kurulu değilse test simülasyonu dön
             return "Merhaba randevu almak istiyorum"

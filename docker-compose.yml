@@ -16,7 +16,8 @@ services:
     restart: always
     ports:
       - "8000:8000"
-      - "8010:8010"
+      - "8010:8010/udp"
+      - "10000-10100:10000-10100/udp" # RTP ports
     env_file:
       - .env
     volumes:

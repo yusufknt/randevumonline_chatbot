@@ -28,21 +28,14 @@ class VoicePipeline:
         self.llm = VoiceLLMEngine(business_slug=session.business_slug or "berber_mehmet_kutahya")
         self.tts = TextToSpeechEngine()
         self._tts_task: asyncio.Task | None = None
-
     async def handle_incoming_audio(
         self,
         pcm_audio: bytes,
         send_audio_cb: Callable[[bytes], Coroutine[Any, Any, None]],
     ) -> None:
-        """Gelen ses paketini alır, gerekirse barge-in kesmesi yapar ve akışı yürütür."""
+        """Gelen ses paketini alır ve akışı yürütür."""
         if not pcm_audio:
             return
-
-        # 1. BARGE-IN KONTROLÜ: Eğer asistan konuşurken müşteri konuşmaya başlarsa TTS görevini kes
-        if self.session.state == SessionState.SPEAKING and self._tts_task and not self._tts_task.done():
-            logger.info("[Barge-in] Müşteri araya girdi, asistan susuyor: session_id=%s", self.session.session_id)
-            self._tts_task.cancel()
-            self.session.update_state(SessionState.LISTENING)
 
         self.session.update_state(SessionState.LISTENING)
 
@@ -88,11 +81,20 @@ class VoicePipeline:
         try:
             async for chunk in self.tts.synthesize_stream(text):
                 await send_audio_cb(chunk)
+                chunk_duration = len(chunk) / 8000.0
+                await asyncio.sleep(chunk_duration)
                 self.session.total_audio_frames_sent += 1
             logger.info("✅ TTS ses parçaları başarıyla müşteriye iletildi. (session_id=%s)", self.session.session_id)
             self.session.update_state(SessionState.LISTENING)
+            
+            # Eğer [KAPAT] etiketi alınmışsa çağrıyı sonlandır
+            if hasattr(self.llm, "is_session_closed") and self.llm.is_session_closed:
+                logger.info("📞 Görüşme tamamlandı, çağrı sonlandırılıyor (Session CLOSED).")
+                self.session.update_state(SessionState.CLOSED)
+                if hasattr(self, 'on_hangup') and self.on_hangup:
+                    self.on_hangup()
+
         except asyncio.CancelledError:
-            logger.debug("TTS yayını iptal edildi (Barge-in tetiklendi)")
             raise
         except Exception as e:
             logger.error("❌ TTS Hatası: %s (session_id=%s)", str(e), self.session.session_id)
