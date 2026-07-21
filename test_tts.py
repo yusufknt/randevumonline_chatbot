@@ -1,9 +1,13 @@
 import asyncio
+import logging
+logging.basicConfig(level=logging.DEBUG)
 from app.voice.tts import TextToSpeechEngine
-async def main():
-    e = TextToSpeechEngine()
-    pcm = await asyncio.to_thread(e._synthesize_pcm, 'Merhaba')
-    with open('test_output.alaw', 'wb') as f:
-        f.write(pcm)
-    print(f"File size: {len(pcm)} bytes")
-asyncio.run(main())
+
+async def test_tts():
+    tts = TextToSpeechEngine()
+    chunks = 0
+    async for chunk in tts.synthesize_stream("Merhaba dünya"):
+        chunks += 1
+    print(f"Chunks generated: {chunks}")
+
+asyncio.run(test_tts())

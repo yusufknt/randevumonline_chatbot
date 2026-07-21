@@ -22,3 +22,9 @@ edge-tts>=7.0
 #   modülleriyle birlikte). Aktif AI (app/core/ai.py + tools.py — Groq, OpenAI-uyumlu)
 #   yalnız httpx kullanır; ek paket gerektirmez.
 pygame-ce==2.5.7
+soxr==1.0.0
+rapidfuzz==3.14.3
+prometheus-client==0.23.1
+faster-whisper==1.2.1
+onnxruntime==1.27.0
+numpy==2.5.1

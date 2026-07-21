@@ -63,6 +63,11 @@ async def init_indexes() -> None:
                                      sparse=True)
     await db.businesses.create_index("channels.instagram.ig_user_id",
                                      sparse=True)
+    await db.businesses.create_index(
+        "channels.voice.dids",
+        unique=True,
+        partialFilterExpression={"channels.voice.dids": {"$type": "array"}},
+    )
 
     await db.staff.create_index([("business_id", 1), ("is_active", 1)])
 
@@ -103,6 +108,8 @@ async def init_indexes() -> None:
 
     # Webhook tekrarlarına karşı idempotency: işlenen mesaj id'leri 24 saat tutulur.
     await db.processed_messages.create_index("created_at", expireAfterSeconds=86400)
+    await db.voice_calls.create_index("created_at", expireAfterSeconds=2592000)
+    await db.voice_calls.create_index([("business_id", 1), ("created_at", -1)])
 
     # İnsana aktarma (handoff) kuyruğu — açık (resolved=False) kayıtlar bir
     # operasyon panelinden/cron'dan okunabilir.
@@ -193,6 +200,32 @@ async def upsert_customer_by_instagram(
         return_document=True,
     )
     return res
+
+
+async def upsert_customer_by_phone(
+    business_id: ObjectId, phone: str, name: str | None = None
+) -> dict:
+    db = get_db()
+    now = datetime.now(timezone.utc)
+    return await db.customers.find_one_and_update(
+        {"business_id": business_id, "phone": phone},
+        {
+            "$setOnInsert": {
+                "business_id": business_id,
+                "phone": phone,
+                "name": name or "Telefon Müşterisi",
+                "tags": [],
+                "total_appointments": 0,
+                "no_show_count": 0,
+                "cancel_count": 0,
+                "is_blocked": False,
+                "consent": {"marketing_sms": False, "kvkk_accepted_at": None},
+                "created_at": now,
+            }
+        },
+        upsert=True,
+        return_document=True,
+    )
 
 
 async def upsert_conversation(

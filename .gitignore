@@ -51,6 +51,7 @@ coverage.xml
 *.key
 secrets/
 vault/
+cookies.txt
 
 # Editors / OS
 .vscode/

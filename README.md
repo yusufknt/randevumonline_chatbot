@@ -132,12 +132,13 @@ Telefon Çağrısı
 
 **Voice Bot (Sesli Asistan) Özellikleri:**
 - **Zero-Delay Startup (Sıfır Gecikmeli Karşılama)**: Çağrı açıldığı an, herhangi bir LLM veya TTS işlemini beklemeden `app/voice/assets/greeting.alaw` üzerinden hazır karşılama anonsu çalınır. Bu sayede bekleme süreleri tamamen ortadan kalkar. Dosya bulunamazsa otomatik olarak eski modele (Dinamik TTS) döner.
-- **Half-Duplex (Telsiz) Modu**: Asistan konuşurken arka plan gürültüsüyle yanlışlıkla sözünün kesilmesini önlemek için, asistan konuşmasını tamamen bitirmeden mikrofondan gelen ses paketleri yoksayılır.
+- **Full-Duplex (Doğal Konuşma / Barge-in) Modu**: ChatGPT Voice benzeri, asistan konuşurken kullanıcı araya girdiğinde anında susma ve yeni söylenenleri dikkate alarak bağlamı yeniden kurma yeteneği (Faz 3).
+- **Akıllı Çağrı Sonlandırma (Graceful Termination)**: Görüşme bittiğinde asistanın 1 saniye bekleyip SIP üzerinden `BYE` göndererek ve `200 OK` onayı bekleyerek çağrıyı pürüzsüz bir şekilde sonlandırması (Faz 4).
 
 **NetGSM Test Adımları:**
 1. Sunucu üzerinde projeyi güncelleyin ve başlatın: 
    ```bash
-   git pull && docker-compose up -d --build
+   git pull && .venv/bin/python3 -m scripts.run_voice_server
    ```
 2. Asterisk veya kullandığınız SIP sunucunuzun Netgsm trunk ayarlarını yapın.
 3. Asterisk `extensions.conf` üzerinden gelen çağrıları `AudioSocket` ile `tcp://<SUNUCU-IP>:8010` adresine yönlendirin.

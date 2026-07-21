@@ -1,16 +1,20 @@
 """
 FAZ 3 - Sesli Asistan (Voice Agent) LLM ve Diyalog Yöneticisi.
 
-Bu modül, telefon konuşmalarına özel kısa, insani ve doğal Türkçe yanıtlar
-üretmek üzere Groq / Ollama entegrasyonu sağlar.
+Bu modül, STT'den gelen metni alıp randevu iş kurallarına göre uygun yanıtı
+üretmek üzere DeepSeek entegrasyonu sağlar.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import re
 import time
-from datetime import date
+import typing
+from datetime import date, datetime
 from typing import Any
+
 
 import httpx
 
@@ -20,50 +24,35 @@ from app.voice.tools import VoiceToolExecutor
 
 logger = logging.getLogger(__name__)
 
-VOICE_SYSTEM_PROMPT = """Sen {business_name} sesli asistanısın. Müşterilerle telefonda en kısa, net ve anlaşılır şekilde konuşursun.
+VOICE_SYSTEM_PROMPT = """Sen {business_name} işletmesinin dijital asistanısın. Kendini hiçbir zaman Mehmet veya işletme sahibi olarak tanıtma; her zaman 'ben asistanım' veya 'asistanınızım' şeklinde tanıt. Müşterilerle telefonda en kısa, net ve anlaşılır şekilde konuşursun.
 Gereksiz uzatmalardan kaçın. En fazla 1-2 kısa cümle kur. Bugünün tarihi: {today_date}.
-DİKKAT (ÇOK ÖNEMLİ): Konuşmalarında ASLA markdown (yıldız, alt çizgi vb.) kullanma. Sayıları, fiyatları, tarihleri ve saatleri bir insanın telefonda söyleyeceği gibi, tamamen okunduğu gibi doğal bir konuşma diliyle yaz (örn: "15:00" yerine "öğleden sonra üç" veya "saat on beş", "250 TL" yerine "iki yüz elli lira", "15.07.2026" yerine "on beş temmuz"). Müşteriye karşı son derece doğal, gerçekçi ve akıcı bir telefon görüşmesi yapıyormuş gibi davran.
+DİKKAT (ÇOK ÖNEMLİ): Konuşmalarında ASLA markdown (yıldız, alt çizgi vb.) kullanma. Sayıları, fiyatları, tarihleri ve saatleri bir insanın telefonda söyleyeceği gibi, tamamen okunduğu gibi doğal bir konuşma diliyle yaz. Müşteriye karşı son derece doğal, gerçekçi ve akıcı bir telefon görüşmesi yapıyormuş gibi davran.
+ASLA MÜŞTERİYE SEÇENEKLERİ (TÜM USTALARI, TÜM HİZMETLERİ VEYA TÜM BOŞ SAATLERİ) LİSTELEYEREK SAYMA! Müşteri sormadıkça seçenekleri okumak yerine "Hangi ustayı istersiniz?", "Hangi işlemi yaptıracaksınız?" veya "Saat kaçta gelmek istersiniz?" gibi doğrudan sorular sor.
+
 Müşterinin Mevcut Randevuları:
 {user_appointments}
 
-Diyalog Akışı SIKICA ŞU SIRAYLA OLMALIDIR:
-1. ADIM: Personel Seçimi: Müşteriye ilk olarak hangi ustayı ({staff_list}) tercih ettiğini sor. (Müşteri usta söylemeden asla devam etme).
-2. ADIM: Gün Bilgisi: Usta seçildikten sonra "Hangi gün randevu istersiniz?" diye sor.
-3. ADIM: Müsaitlik Kontrolü: Müşteri usta ve GÜN seçtiğinde, o günkü müsait saatleri öğrenmek zorundasın. Bunun için SADECE kendi kendine şu özel etiketi oluştur ve müşteriye HİÇBİR ŞEY SÖYLEME (cevap metnin sadece bu etiket olsun):
+Diyalog Akışı:
+1. Müşterinin söylediği usta, hizmet, gün ve saat bilgilerinin TAMAMINI, hangi sırayla söylenirse söylensin kabul et ve koru. Müşteri TEK BİR CÜMLEDE tüm bilgileri verirse (örn: "Yarın 14'e Mehmet ustaya saç kesimi randevusu istiyorum"), ASLA başka bir şey sorma veya seçenek sunma, doğrudan onaylayıp [RANDEVU] etiketi üret.
+2. Müşterinin daha önce veya aynı cümlede verdiği bir bilgiyi ASLA tekrar sorma.
+3. Yalnızca gerçekten eksik olan tek bilgiyi kısa bir soruyla iste (Seçenekleri saymadan).
+Sistem her turda "GÜNCEL OTURUM HAFIZASI" verebilir. Bu hafızadaki dolu alanları müşterinin daha önce söylediği kesin bilgiler olarak kabul et.
+4. Gün verilmiş ama saat verilmemişse müsait saatleri öğrenmek için SADECE şu etiketi oluştur ve müşteriye hiçbir şey söyleme:
    [KONTROL: Usta Adı | YYYY-MM-DD | Belirsiz]
-   Örnek: [KONTROL: Yusuf | 2026-07-15 | Belirsiz] (Hizmet daha sorulmadığı için 3. parametreye Belirsiz yaz).
    Bu etiketi gönderdiğinde sistem sana o günün boş saatlerini döndürecek.
-4. ADIM: Saat Seçimi: Sistem sana boş saatleri verdiğinde, müşteriye "Şu saatler boş: 10:00, 11:30. Hangisi uygun?" diye sor.
-5. ADIM: Hizmet Seçimi: Müşteri saatini seçtikten sonra, randevuyu kaydetmeden önce "Hangi hizmeti almak istersiniz?" diye sor. SADECE müşteri hizmetleri sorarsa veya bilemezse "{services_list}" seçeneklerini sun. Eğer sormazsa hizmetleri SAYMA.
-6. ADIM: Randevu Onayı: Müşteri hizmeti de seçtiğinde, işlemi onaylamak için KESİNLİKLE şu özel etiketi kullan:
+5. Usta, hizmet, gün ve saat hazır olduğunda ek onay veya müsait saat listesi istemeden KESİNLİKLE şu etiketi kullan:
    [RANDEVU: YYYY-MM-DD HH:MM | Usta Adı | Hizmet Adı | Müşteri Adı]
-   Örnek: [RANDEVU: 2026-07-15 10:00 | Yusuf | Saç Kesimi | Ahmet]
-
-Eğer müşteri var olan bir randevusunu İPTAL ETMEK isterse:
-Cevabının en sonuna ŞU KODU KESİNLİKLE EKLE: [IPTAL: Randevu_ID]
-(Sistem sana ID'leri mesaj geçmişinde verecek).
-
-Eğer müşteri görüşmeyi bitirmek, kapatmak, veda etmek isterse veya randevu alındıktan sonra başka isteği olmadığını belirtip teşekkür ederse:
-Cevabının en sonuna KESİNLİKLE ŞU KODU EKLE: [KAPAT]
-(Örnek: İyi günler dileriz. [KAPAT])
-
-Eğer müşteri var olan bir randevusunu REVİZE ETMEK (saatini, gününü, ustasını veya hizmetini değiştirmek) isterse:
-1. Önce [KONTROL: Yeni Usta Adı | Yeni Tarih | Yeni Hizmet] etiketiyle müsaitliğe bak (Değişmeyenlere - koyabilirsin).
-2. Müşteri boş saatlerden birini seçtiğinde (veya sadece usta/hizmet değişiyorsa hemen), cevabının en sonuna ŞU KODU KESİNLİKLE EKLE: 
-[REVIZE: Randevu_ID | YYYY-MM-DD HH:MM | Yeni_Usta_Adı | Yeni_Hizmet_Adı]
-NOT: Eğer bir bilgi (örneğin usta veya saat) DEĞİŞMİYORSA yerine "-" (tire) koy.
-Örnek: [REVIZE: 6a50ef... | 2026-07-15 14:30 | - | Sakal Tıraşı] veya [REVIZE: 6a50ef... | - | Mehmet | -]
 """
 
-
-
-def parse_target_date_tr(text: str) -> tuple[date, str]:
-    """Türkçe tarih ifadelerini ('15 temmuz', '2 hafta sonra cuma', 'yarın' vb.) algılayıp gerçek takvim tarihini döndürür."""
+def parse_target_date_tr(
+    text: str, reference_date: date | None = None
+) -> tuple[date, str]:
+    """Türkçe göreli tarihleri takvim haftasına göre çözümler."""
     import re
     from datetime import date, timedelta
 
-    today = date.today()
-    lower = text.lower()
+    today = reference_date or date.today()
+    lower = text.replace("İ", "i").replace("I", "ı").lower()
 
     # 1. Tam Tarihler (Örn: 15 temmuz)
     months = {
@@ -85,20 +74,26 @@ def parse_target_date_tr(text: str) -> tuple[date, str]:
         except ValueError:
             pass
 
-    # 2. Hafta İlerletme (Örn: 2 hafta sonra)
-    weeks_to_add = 0
-    if "haftaya" in lower or "haftada" in lower:
-        weeks_to_add = 1
-    
+    # 2. Doğrudan göreli günler
+    if "bugün" in lower:
+        return today, "Bugün"
+    if "öbür gün" in lower:
+        return today + timedelta(days=2), "Öbür gün"
+    if "yarın" in lower:
+        return today + timedelta(days=1), "Yarın"
+
+    # 3. Takvim haftası ifadeleri
+    next_week = any(
+        phrase in lower
+        for phrase in ("haftaya", "gelecek hafta", "önümüzdeki hafta")
+    )
+    weeks_to_add = 1 if next_week else 0
+
     week_match = re.search(r"(\d+|bir|iki|üç|dört|beş)\s*hafta\s*sonra", lower)
     if week_match:
+        week_numbers = {"bir": 1, "iki": 2, "üç": 3, "dört": 4, "beş": 5}
         val = week_match.group(1)
-        if val == "bir": weeks_to_add = 1
-        elif val == "iki": weeks_to_add = 2
-        elif val == "üç": weeks_to_add = 3
-        elif val == "dört": weeks_to_add = 4
-        elif val == "beş": weeks_to_add = 5
-        elif val.isdigit(): weeks_to_add = int(val)
+        weeks_to_add = int(val) if val.isdigit() else week_numbers[val]
 
     weekdays = {
         "pazartesi": (0, "Pazartesi"), "salı": (1, "Salı"), "çarşamba": (2, "Çarşamba"),
@@ -106,28 +101,30 @@ def parse_target_date_tr(text: str) -> tuple[date, str]:
         "pazar": (6, "Pazar")
     }
 
-    # Haftanın günü belirtilmiş mi? (Örn: 2 hafta sonra Cuma)
+    current_monday = today - timedelta(days=today.weekday())
     for tr_name, (target_wd, display_name) in weekdays.items():
         if tr_name in lower:
-            days_ahead = (target_wd - today.weekday()) % 7
-            if days_ahead == 0 and weeks_to_add == 0:
-                days_ahead = 7  # Önümüzdeki o gün
-            target_date = today + timedelta(days=days_ahead + (weeks_to_add * 7))
-            label = display_name
             if weeks_to_add > 0:
-                label = f"{weeks_to_add} hafta sonra {display_name}"
-            elif "haftaya" in lower:
-                label = f"Haftaya {display_name}"
+                target_date = current_monday + timedelta(
+                    days=(weeks_to_add * 7) + target_wd
+                )
+                label = (
+                    f"Haftaya {display_name}"
+                    if next_week and not week_match
+                    else f"{weeks_to_add} hafta sonra {display_name}"
+                )
+            else:
+                days_ahead = (target_wd - today.weekday()) % 7
+                if days_ahead == 0 and "bu " not in lower:
+                    days_ahead = 7
+                target_date = today + timedelta(days=days_ahead)
+                label = display_name
             return target_date, label
 
     if weeks_to_add > 0:
-        return today + timedelta(days=weeks_to_add * 7), f"{weeks_to_add} hafta sonra"
-
-    # 3. Göreceli ifadeler
-    if "bugün" in lower:
-        return today, "Bugün"
-    elif "öbür gün" in lower:
-        return today + timedelta(days=2), "Öbür gün"
+        target_date = current_monday + timedelta(days=weeks_to_add * 7)
+        label = "Haftaya" if next_week and not week_match else f"{weeks_to_add} hafta sonra"
+        return target_date, label
 
     # Varsayılan: Yarın
     return today + timedelta(days=1), "Yarın"
@@ -163,13 +160,68 @@ def normalize_turkish_text(text: str) -> str:
     return text
 
 
+def format_available_slots(slots: list[str]) -> str:
+    """Boş saatleri gruplayarak (örn. '09:00 ile 12:00 arası') daha doğal okunabilir metne çevirir."""
+    if not slots:
+        return "Maalesef dolu"
+        
+    def to_mins(tstr: str) -> int:
+        try:
+            h, m = map(int, tstr.split(':'))
+            return h * 60 + m
+        except Exception:
+            return 0
+
+    parsed = sorted((to_mins(s), s) for s in slots if ":" in s)
+    if not parsed:
+        return ", ".join(slots)
+    
+    blocks = []
+    current_block = [parsed[0]]
+    
+    for i in range(1, len(parsed)):
+        # 60 dakika veya daha az fark varsa bitişik say
+        if parsed[i][0] - current_block[-1][0] <= 60:
+            current_block.append(parsed[i])
+        else:
+            blocks.append(current_block)
+            current_block = [parsed[i]]
+    blocks.append(current_block)
+    
+    desc_parts = []
+    for block in blocks:
+        if len(block) >= 3:
+            start_str = block[0][1]
+            end_str = block[-1][1]
+            desc_parts.append(f"{start_str} ile {end_str} arası")
+        else:
+            for _, sstr in block:
+                desc_parts.append(sstr)
+                
+    if not desc_parts:
+        return "Maalesef dolu"
+        
+    if len(desc_parts) == 1:
+        if len(slots) >= 8 and "arası" in desc_parts[0]:
+            return f"tüm gün {desc_parts[0]} müsait"
+        return desc_parts[0]
+    
+    return ", ".join(desc_parts[:-1]) + " ve " + desc_parts[-1]
+
+
 class VoiceLLMEngine:
     """Sesli aramalar için LLM diyalog yöneticisi."""
 
-    def __init__(self, business_slug: str = "berber_mehmet_kutahya") -> None:
-        self.business_slug = business_slug
+    def __init__(
+        self,
+        business_slug: str | None = None,
+        customer_phone: str | None = None,
+    ) -> None:
+        voice_settings = get_voice_settings()
+        self.business_slug = business_slug or voice_settings.voice_default_business_slug or ""
+        self.customer_phone = customer_phone or "anonymous"
         self.settings = get_settings()
-        self.voice_settings = get_voice_settings()
+        self.voice_settings = voice_settings
         self.history: list[dict[str, Any]] = [
             {"role": "system", "content": VOICE_SYSTEM_PROMPT}
         ]
@@ -180,28 +232,204 @@ class VoiceLLMEngine:
         self.memory_service: str | None = None
         self.memory_staff: str | None = None
         self.memory_time_pref: str | None = None
+        self.booking_in_progress: bool = False
+        self._db_services: list[str] = []
+        self._db_staff: list[str] = []
 
         # Süre ve Tur Limiti Koruması (Graceful Exit / Fallback)
         self.session_start_time: float = time.time()
         self.turn_count: int = 0
         self.is_session_closed: bool = False
+        
+        self._http_client: httpx.AsyncClient | None = None
+
+    async def _get_client(self) -> httpx.AsyncClient:
+        if self._http_client is None:
+            self._http_client = httpx.AsyncClient(timeout=self.voice_settings.ai_request_timeout_s)
+        return self._http_client
+
+    async def close(self):
+        if self._http_client:
+            await self._http_client.aclose()
+            self._http_client = None
+
+    @staticmethod
+    def _tr_lower(text: str) -> str:
+        return text.replace("İ", "i").replace("I", "ı").lower()
+
+    @classmethod
+    def _search_text(cls, text: str) -> str:
+        lowered = cls._tr_lower(text).replace("&", " ve ").replace("+", " ve ")
+        return re.sub(r"[^a-zçğıöşü0-9]+", " ", lowered).strip()
+
+    @staticmethod
+    def _extract_explicit_date(text: str) -> tuple[date, str] | None:
+        lower = VoiceLLMEngine._tr_lower(text)
+        numeric = re.search(
+            r"\b(\d{1,2})[./-](\d{1,2})(?:[./-](\d{2,4}))?\b",
+            lower,
+        )
+        if numeric:
+            day, month = int(numeric.group(1)), int(numeric.group(2))
+            year_text = numeric.group(3)
+            year = int(year_text) if year_text else date.today().year
+            if year < 100:
+                year += 2000
+            try:
+                parsed = date(year, month, day)
+                if not year_text and parsed < date.today():
+                    parsed = date(year + 1, month, day)
+                return parsed, parsed.strftime("%d.%m.%Y")
+            except ValueError:
+                return None
+
+        date_words = (
+            "pazartesi", "salı", "çarşamba", "perşembe", "cuma",
+            "cumartesi", "pazar", "yarın", "bugün", "öbür gün",
+            "ocak", "şubat", "mart", "nisan", "mayıs", "haziran",
+            "temmuz", "ağustos", "eylül", "ekim", "kasım", "aralık",
+            "hafta",
+        )
+        if any(word in lower for word in date_words):
+            return parse_target_date_tr(text)
+        return None
+
+    @staticmethod
+    def _extract_explicit_time(text: str) -> str | None:
+        lower = VoiceLLMEngine._tr_lower(text)
+        patterns = (
+            r"\bsaat\s*(\d{1,2})(?:[:.](\d{2}))?\b",
+            r"\b(\d{1,2})[:.](\d{2})\b",
+            r"\b(\d{1,2})\s*['’]?\s*(?:de|da|te|ta)\b",
+            r"\b(\d{1,2})\s*(?:için|randevusuna|randevuya)\b",
+        )
+        for pattern in patterns:
+            match = re.search(pattern, lower)
+            if not match:
+                continue
+            hour = int(match.group(1))
+            minute = int(match.group(2) or 0) if match.lastindex and match.lastindex >= 2 else 0
+            if 0 <= hour <= 23 and 0 <= minute <= 59:
+                return f"{hour:02d}:{minute:02d}"
+
+        number_words = {
+            "dokuz": 9, "on": 10, "on bir": 11, "on iki": 12,
+            "on üç": 13, "on dört": 14, "on beş": 15, "on altı": 16,
+            "on yedi": 17, "on sekiz": 18, "on dokuz": 19,
+            "yirmi": 20,
+        }
+        word_match = re.search(
+            r"\bsaat\s+(dokuz|on dokuz|on sekiz|on yedi|on altı|on beş|"
+            r"on dört|on üç|on iki|on bir|on|yirmi)\b",
+            lower,
+        )
+        if word_match:
+            return f"{number_words[word_match.group(1)]:02d}:00"
+        return None
+
+    def _remember_booking_details(self, user_text: str) -> None:
+        lower = self._tr_lower(user_text)
+        searchable = self._search_text(user_text)
+
+        cancellation_or_change = any(
+            word in lower
+            for word in ("iptal", "değiştir", "değişiklik", "revize", "ertele")
+        )
+        booking_words = (
+            "randevu" in lower
+            and any(word in lower for word in ("al", "oluştur", "ist", "yap"))
+        )
+
+        parsed_date = self._extract_explicit_date(user_text)
+        parsed_time = self._extract_explicit_time(user_text)
+        if parsed_date:
+            self.memory_date, self.memory_date_label = parsed_date
+        if parsed_time:
+            self.memory_time = parsed_time
+
+        for staff in self._db_staff:
+            staff_search = self._search_text(staff)
+            first_name = staff_search.split()[0]
+            if staff_search in searchable or re.search(rf"\b{re.escape(first_name)}\b", searchable):
+                self.memory_staff = staff
+                break
+
+        for service in sorted(self._db_services, key=len, reverse=True):
+            service_search = self._search_text(service)
+            if service_search and service_search in searchable:
+                self.memory_service = service
+                break
+
+        service_aliases = {
+            "saç kestir": "Saç Kesimi",
+            "saç kesim": "Saç Kesimi",
+            "sakal tıraş": "Sakal Tıraşı",
+            "saç sakal": "Saç + Sakal",
+        }
+        if self.memory_service is None:
+            for alias, canonical in service_aliases.items():
+                if alias in searchable and canonical in self._db_services:
+                    self.memory_service = canonical
+                    break
+
+        if not cancellation_or_change and (
+            booking_words
+            or (self.booking_in_progress and user_text.strip())
+            or (
+                any((parsed_date, parsed_time, self.memory_staff, self.memory_service))
+                and "almak ist" in lower
+            )
+        ):
+            self.booking_in_progress = True
+
+    def _booking_memory_context(self) -> str:
+        return (
+            "GÜNCEL OTURUM HAFIZASI (müşterinin söylediklerinden çıkarıldı):\n"
+            f"- Randevu niyeti: {'var' if self.booking_in_progress else 'belirsiz'}\n"
+            f"- Usta: {self.memory_staff or 'eksik'}\n"
+            f"- Hizmet: {self.memory_service or 'eksik'}\n"
+            f"- Tarih: {self.memory_date.isoformat() if self.memory_date else 'eksik'}\n"
+            f"- Saat: {self.memory_time or 'eksik'}\n"
+            "Son kullanıcı cümlesini doğal anlamıyla değerlendir. Hafızada dolu olan "
+            "alanları yeniden sorma; yalnızca eksik alan varsa onu sor.\n"
+            "ÖNEMLİ: Eğer yukarıdaki tüm bilgiler (Usta, Hizmet, Tarih, Saat) EKSİKSİZ ise randevuyu onaylatmadan KESİNLİKLE [RANDEVU: YYYY-MM-DD HH:MM | Usta | Hizmet | Müşteri] etiketini oluştur! Müşteri aynı aramada 2. veya 3. randevusunu alıyor olsa bile her seferinde bu etiketi üretmelisin."
+        )
 
 
 
 
-    async def generate_response(self, user_text: str) -> str:
-        """Kullanıcı metnini alır ve sesli asistandan kısa bir cevap döndürür."""
-        if not user_text.strip():
-            return ""
+    async def generate_response(self, user_text: str) -> typing.AsyncGenerator[str, None]:
+        """Kullanıcı metnini alır ve sesli asistandan cümle cümle cevap döndürür."""
+        if not user_text and getattr(self, "_services_fetched", None) is not None:
+            # Recursive çağrılarda (user_text="" ise) boşsa devam et
+            pass
+        elif not user_text.strip():
+            return
 
         # İlk kez çağrıldığında sistem promptuna gerçek hizmetleri dinamik olarak ekle
         if getattr(self, "_services_fetched", None) is None:
             self._services_fetched = True
-            db_services_str = await VoiceToolExecutor.get_services(self.business_slug, return_detailed_string=True)
-            db_staff = await VoiceToolExecutor.get_staff(self.business_slug)
-            db_business = await VoiceToolExecutor.get_business_info(self.business_slug)
-            # Sabit telefon no ile müşteri randevularını çek (Gerçek senaryoda çağrı numarasından alınır)
-            user_apts = await VoiceToolExecutor.get_customer_appointments(self.business_slug, "+905321112233")
+            (
+                db_services_str,
+                db_services,
+                db_staff,
+                db_business,
+                user_apts,
+            ) = await asyncio.gather(
+                VoiceToolExecutor.get_services(
+                    self.business_slug,
+                    return_detailed_string=True,
+                ),
+                VoiceToolExecutor.get_services(self.business_slug),
+                VoiceToolExecutor.get_staff(self.business_slug),
+                VoiceToolExecutor.get_business_info(self.business_slug),
+                VoiceToolExecutor.get_customer_appointments(
+                    self.business_slug,
+                    self.customer_phone,
+                ),
+            )
+            self._db_services = list(db_services)
+            self._db_staff = list(db_staff)
             
             services_str = db_services_str if db_services_str else "Saç Kesimi, Sakal Tıraşı"
             staff_str = " veya ".join(db_staff) if db_staff else "Mehmet usta veya Yusuf usta"
@@ -210,7 +438,6 @@ class VoiceLLMEngine:
             apts_strs = [f"ID: {a['id']} | Tarih: {a['date']} | Usta: {a['staff']} | Hizmet: {a['service']}" for a in user_apts]
             user_apts_str = "\n".join(apts_strs) if apts_strs else "Müşterinin aktif randevusu bulunmuyor."
             
-            from datetime import datetime
             from zoneinfo import ZoneInfo
             today_str = datetime.now(ZoneInfo("Europe/Istanbul")).strftime("%Y-%m-%d (%A)")
             
@@ -221,6 +448,9 @@ class VoiceLLMEngine:
                 today_date=today_str,
                 user_appointments=user_apts_str
             )
+
+        if user_text:
+            self._remember_booking_details(user_text)
 
         # Süre veya Tur Limiti Aşıldıysa ya da Görüşme Kapatıldıysa Otomatik Kapanış Mesajı Dön
         elapsed_s = time.time() - self.session_start_time
@@ -236,168 +466,261 @@ class VoiceLLMEngine:
                 elapsed_s,
                 self.turn_count,
             )
-            return normalize_turkish_text(self.voice_settings.voice_timeout_message)
+            yield normalize_turkish_text(self.voice_settings.voice_timeout_message)
+            return
 
         self.history.append({"role": "user", "content": user_text})
 
-        # DeepSeek veya Groq API Anahtarı Kontrolü
-        api_key = self.voice_settings.deepseek_api_key or self.settings.groq_api_key
+        # DeepSeek API Anahtarı Kontrolü
+        api_key = self.voice_settings.deepseek_api_key
         if not api_key:
-            return normalize_turkish_text(await self._fallback_simulated_response(user_text))
+            yield normalize_turkish_text(await self._fallback_simulated_response(user_text))
+            return
 
-        # DeepSeek öncelikli yapılandırma seçimi
-        if self.voice_settings.deepseek_api_key:
-            base_url = self.voice_settings.deepseek_base_url
-            model = self.voice_settings.deepseek_model
-            timeout = self.voice_settings.ai_request_timeout_s
-        else:
-            base_url = self.settings.groq_base_url
-            model = self.settings.groq_model
-            timeout = self.settings.ai_request_timeout_s
+        base_url = self.voice_settings.deepseek_base_url
+        model = self.voice_settings.deepseek_model
 
         try:
             aggregated_assistant_text = ""
-            for _ in range(2):
-                async with httpx.AsyncClient(timeout=timeout) as client:
-                    resp = await client.post(
-                        f"{base_url}/chat/completions",
-                        headers={
-                            "Authorization": f"Bearer {api_key}",
-                            "Content-Type": "application/json",
-                        },
-                        json={
-                            "model": model,
-                            "messages": self.history,
-                            "temperature": 0.3,
-                            "max_tokens": 150,
-                        },
-                    )
-                    resp.raise_for_status()
-                    data = resp.json()
-                    assistant_text = data["choices"][0]["message"]["content"].strip()
+            client = await self._get_client()
+            request_messages = [
+                *self.history[:-1],
+                {"role": "system", "content": self._booking_memory_context()},
+                self.history[-1],
+            ]
+            
+            # Stream isteği at
+            async with client.stream(
+                "POST",
+                f"{base_url}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": model,
+                    "messages": request_messages,
+                    "temperature": 0.3,
+                    "max_tokens": 150,
+                    "stream": True,
+                },
+            ) as resp:
+                resp.raise_for_status()
+                
+                import json
+                
+                buffer = ""
+                # Noktalama işaretlerine göre cümleleri ayırma
+                punctuation = set(".?!")
+                
+                async for line in resp.aiter_lines():
+                    if not line or line.strip() == "":
+                        continue
+                    if line.startswith("data: "):
+                        line = line[6:]
+                    if line == "[DONE]":
+                        break
+                        
+                    try:
+                        data = json.loads(line)
+                        if "choices" in data and len(data["choices"]) > 0:
+                            delta = data["choices"][0].get("delta", {})
+                            content = delta.get("content", "")
+                            if content:
+                                buffer += content
+                                aggregated_assistant_text += content
+                                
+                                # Eğer tamponda noktalama işareti varsa veya belli bir uzunluğa ulaştıysa cümleyi yield et
+                                # Kontrol etiketleri [] içinde olduğu için '[' içeriyorsa yield etmeyi bekle
+                                if any(p in content for p in punctuation) and "[" not in buffer:
+                                    sentence = buffer.strip()
+                                    if sentence:
+                                        yield normalize_turkish_text(sentence)
+                                    buffer = ""
+                    except json.JSONDecodeError:
+                        continue
+                        
+                # Kalan metni yield etmeden önce etiketleri ayrıştırmamız lazım!
+                assistant_text = aggregated_assistant_text.strip()
+                forced_response: str | None = None
                     
-                    import re
+                import re
+                
+                # 1. KONTROL ETİKETİNİ YAKALA (Müsaitlik Sorgusu)
+                kontrol_match = re.search(r"\[KONTROL:\s*([^|]+)\|\s*([^|]+)(?:\|\s*([^\]]+))?\]", assistant_text)
+                if kontrol_match:
+                    staff_name = kontrol_match.group(1).strip()
+                    date_str = kontrol_match.group(2).strip()
+                    service_name = kontrol_match.group(3).strip() if kontrol_match.group(3) else "Belirsiz"
                     
-                    # 1. KONTROL ETİKETİNİ YAKALA (Müsaitlik Sorgusu)
-                    kontrol_match = re.search(r"\[KONTROL:\s*([^|]+)\|\s*([^|]+)(?:\|\s*([^\]]+))?\]", assistant_text)
-                    if kontrol_match:
-                        staff_name = kontrol_match.group(1).strip()
-                        date_str = kontrol_match.group(2).strip()
-                        service_name = kontrol_match.group(3).strip() if kontrol_match.group(3) else "Belirsiz"
+                    logger.info("🔍 LLM Müsaitlik Sorgusu Tetikledi! Usta: %s, Tarih: %s, Hizmet: %s", staff_name, date_str, service_name)
+                    
+                    # Gizli etiketi metinden çıkar
+                    clean_text = assistant_text.replace(kontrol_match.group(0), "").strip()
+                    if clean_text:
+                        # Kontrol sırasında asistan SUSMALI (müşteriye boş yere "kontrol ediyorum" denmemeli). 
+                        # O yüzden bu metni sadece geçmişe ekliyoruz, sese (aggregated) vermiyoruz!
+                        pass
                         
-                        logger.info("🔍 LLM Müsaitlik Sorgusu Tetikledi! Usta: %s, Tarih: %s, Hizmet: %s", staff_name, date_str, service_name)
+                    self.history.append({"role": "assistant", "content": clean_text})
                         
-                        # Gizli etiketi metinden çıkar
-                        clean_text = assistant_text.replace(kontrol_match.group(0), "").strip()
-                        if clean_text:
-                            # Kontrol sırasında asistan SUSMALI (müşteriye boş yere "kontrol ediyorum" denmemeli). 
-                            # O yüzden bu metni sadece geçmişe ekliyoruz, sese (aggregated) vermiyoruz!
-                            pass
-                            
-                        self.history.append({"role": "assistant", "content": clean_text})
-                        
-                        # Veritabanından saatleri çek
-                        avail = await VoiceToolExecutor.check_availability(self.business_slug, service_name, date_str, staff_name)
-                        if "error" in avail:
+                    # Veritabanından saatleri çek
+                    avail = await VoiceToolExecutor.check_availability(self.business_slug, service_name, date_str, staff_name)
+                    if "error" in avail:
+                        if avail["error"] == "past_date":
+                            sys_msg = f"SİSTEM BİLGİSİ: İstenilen tarih ({date_str}) geçmişte kaldı! Müşteriye geçmiş bir güne randevu verilemeyeceğini ve ileri bir tarih seçmesini, doğal bir dille söyle."
+                        else:
                             sys_msg = f"SİSTEM BİLGİSİ: Hata oluştu ({avail['error']}). Müşteriye başka bir tarih seçmesini veya usta/hizmet uyuşmazlığı olduğunu söyle."
-                        else:
-                            slots = ", ".join(avail["available_slots"]) if avail["available_slots"] else "Maalesef dolu"
-                            sys_msg = f"SİSTEM BİLGİSİ: {staff_name} için {date_str} tarihindeki boş saatler: {slots}. Müşteriye bunları okuyarak seçmesini iste."
-                            
-                        self.history.append({"role": "user", "content": sys_msg})
-                        continue  # 2. tura dön ve saatlerle birlikte yeni cevabı al!
-
-                    # 2. RANDEVU GİZLİ ETİKETİNİ YAKALA VE VERİTABANINA KAYDET
-                    match = re.search(r"\[RANDEVU:\s*([^|]+)\|\s*([^|]+)\|\s*([^|]+)\|\s*([^\]]+)\]", assistant_text)
-                    if match:
-                        datetime_str = match.group(1).strip()
-                        staff_name = match.group(2).strip()
-                        service_name = match.group(3).strip()
-                        customer_name = match.group(4).strip()
+                    else:
+                        slots = format_available_slots(avail["available_slots"])
+                        sys_msg = f"SİSTEM BİLGİSİ: {staff_name} için {date_str} tarihindeki boş saatler: {slots}. Müşteriye tüm saatleri sayma! Sadece 'Saat kaçta gelmek istersiniz?' diye sor veya sabah/öğleden sonra için yönlendir."
                         
-                        logger.info("📅 LLM Randevu Oluşturma Tetiklendi! Usta: %s, Hizmet: %s, Zaman: %s", staff_name, service_name, datetime_str)
-                        
-                        result = await VoiceToolExecutor.book_appointment(
-                            business_slug=self.business_slug,
-                            service_name=service_name,
-                            staff_name=staff_name,
-                            customer_phone="+905321112233",
-                            customer_name=customer_name,
-                            start_time_local=datetime_str,
-                        )
-                        
-                        if "error" in result:
-                            err = result["error"]
-                            logger.error("Randevu oluşturma hatası: %s", err)
-                            if err == "staff_cannot_perform_service":
-                                assistant_text = f"Üzgünüm, {staff_name} ustamız {service_name} işlemini yapmıyor. Başka bir ustayı veya farklı bir hizmeti tercih eder misiniz?"
-                            else:
-                                assistant_text = f"Sistemde bir hata oluştu ({err}), randevuyu kaydedemedim. Lütfen tekrar deneyin."
-                            self.history.append({"role": "system", "content": f"SİSTEM BİLGİSİ: Hata ({err})."})
-                        else:
-                            logger.info("✅ Randevu başarıyla veritabanına işlendi (ID: %s)", result.get("appointment_id"))
-                            assistant_text = assistant_text.replace(match.group(0), "").strip()
-                            self.history.append({"role": "system", "content": "SİSTEM BİLGİSİ: Randevu BAŞARIYLA oluşturuldu ve veritabanına kaydedildi. Müşteriye başka bir isteği olup olmadığını sor, yoksa vedalaşıp çağrıyı kapatmak için [KAPAT] etiketini kullan."})
-
-                    # 3. İPTAL GİZLİ ETİKETİNİ YAKALA VE VERİTABANINA KAYDET
-                    iptal_match = re.search(r"\[IPTAL:\s*([^\]]+)\]", assistant_text)
-                    if iptal_match:
-                        apt_id = iptal_match.group(1).strip()
-                        logger.info("🗑️ LLM Randevu İptali Tetiklendi! ID: %s", apt_id)
-                        
-                        success = await VoiceToolExecutor.cancel_appointment(apt_id)
-                        if not success:
-                            assistant_text = "Maalesef randevunuzu iptal ederken bir sorun oluştu. Lütfen tekrar deneyin."
-                            self.history.append({"role": "system", "content": "SİSTEM BİLGİSİ: İptal başarısız."})
-                        else:
-                            logger.info("✅ Randevu iptal edildi (ID: %s)", apt_id)
-                            assistant_text = assistant_text.replace(iptal_match.group(0), "").strip()
-                            self.history.append({"role": "system", "content": "SİSTEM BİLGİSİ: Randevu başarıyla iptal edildi. Müşteriye başka bir isteği olup olmadığını sor, yoksa vedalaşıp çağrıyı kapatmak için [KAPAT] etiketini kullan."})
-                            
-                    # 4. REVIZE (Randevu Yeniden Planlama / Hizmet-Usta Değişimi) İşleme
-                    revize_match = re.search(r"\[REVIZE:\s*([^|]+)\|\s*([^|]+)\|\s*([^|]+)\|\s*([^\]]+)\]", assistant_text)
-                    if revize_match:
-                        apt_id = revize_match.group(1).strip()
-                        new_date_str = revize_match.group(2).strip()
-                        new_staff_name = revize_match.group(3).strip()
-                        new_service_name = revize_match.group(4).strip()
-                        
-                        logger.info("🔄 LLM Randevu Revizesi Tetiklendi! ID: %s, Yeni Zaman: %s, Usta: %s, Hizmet: %s", apt_id, new_date_str, new_staff_name, new_service_name)
-                        
-                        result = await VoiceToolExecutor.reschedule_appointment(
-                            self.business_slug, 
-                            apt_id, 
-                            new_date_str,
-                            new_service_name,
-                            new_staff_name
-                        )
-                        if "error" in result:
-                            err = result["error"]
-                            logger.error("Randevu revize hatası: %s", err)
-                            if err == "slot_taken":
-                                assistant_text = "Üzgünüm, seçtiğiniz o saat az önce dolmuş veya ustanın başka bir randevusuyla çakışıyor. Lütfen farklı bir saat seçer misiniz?"
-                            elif err == "staff_cannot_perform_service":
-                                assistant_text = f"Üzgünüm, {new_staff_name} ustamız {new_service_name} işlemini yapmıyor. Başka bir ustayı tercih eder misiniz?"
-                            else:
-                                assistant_text = "Sistemde bir hata oluştu, randevunuzu değiştiremedim. Lütfen tekrar deneyin."
-                            self.history.append({"role": "system", "content": f"SİSTEM BİLGİSİ: Hata ({err})."})
-                        else:
-                            logger.info("✅ Randevu başarıyla revize edildi (ID: %s)", apt_id)
-                            assistant_text = assistant_text.replace(revize_match.group(0), "").strip()
-                            self.history.append({"role": "system", "content": "SİSTEM BİLGİSİ: Randevu başarıyla REVIZE EDİLDİ. Müşteriye başka bir isteği olup olmadığını sor, yoksa vedalaşıp çağrıyı kapatmak için [KAPAT] etiketini kullan."})
+                    self.history.append({"role": "user", "content": sys_msg})
                     
-                    # 5. [KAPAT] Etiketi kontrolü
-                    if "[KAPAT]" in assistant_text:
-                        logger.info("📞 LLM Çağrıyı Kapatma (KAPAT) komutu gönderdi.")
-                        self.is_session_closed = True
-                        assistant_text = assistant_text.replace("[KAPAT]", "").strip()
+                    # 2. tur için recurse ol
+                    async for chunk in self.generate_response(""):
+                        yield chunk
+                    return
 
-                    self.history.append({"role": "assistant", "content": assistant_text})
-                    return normalize_turkish_text((aggregated_assistant_text + assistant_text).strip())
+                # 2. RANDEVU GİZLİ ETİKETİNİ YAKALA VE VERİTABANINA KAYDET
+                match = re.search(r"\[RANDEVU:\s*([^|]+)\|\s*([^|]+)\|\s*([^|]+)\|\s*([^\]]+)\]", assistant_text)
+                if match:
+                    datetime_str = match.group(1).strip()
+                    staff_name = match.group(2).strip()
+                    service_name = match.group(3).strip()
+                    customer_name = match.group(4).strip()
+                    
+                    logger.info("📅 LLM Randevu Oluşturma Tetiklendi! Usta: %s, Hizmet: %s, Zaman: %s", staff_name, service_name, datetime_str)
+                    
+                    result = await VoiceToolExecutor.book_appointment(
+                        business_slug=self.business_slug,
+                        service_name=service_name,
+                        staff_name=staff_name,
+                        customer_phone=self.customer_phone,
+                        customer_name=customer_name,
+                        start_time_local=datetime_str,
+                    )
+                    
+                    if "error" in result:
+                        err = result["error"]
+                        logger.error("Randevu oluşturma hatası: %s", err)
+                        if err == "slot_taken":
+                            assistant_text = "Üzgünüm, seçtiğiniz o saat maalesef az önce doldu veya ustanın başka bir randevusuyla çakışıyor. Lütfen farklı bir saat seçer misiniz?"
+                        elif err == "staff_cannot_perform_service":
+                            assistant_text = f"Üzgünüm, {staff_name} ustamız {service_name} işlemini yapmıyor. Başka bir ustayı veya farklı bir hizmeti tercih eder misiniz?"
+                        else:
+                            assistant_text = f"Sistemde bir hata oluştu ({err}), randevuyu kaydedemedim. Lütfen tekrar deneyin."
+                        forced_response = assistant_text
+                        self.history.append({"role": "system", "content": f"SİSTEM BİLGİSİ: Hata ({err})."})
+                    else:
+                        logger.info("✅ Randevu başarıyla veritabanına işlendi (ID: %s)", result.get("appointment_id"))
+                        confirmation_date = self.memory_date_label
+                        confirmation_time = self.memory_time
+                        if not confirmation_date or not confirmation_time:
+                            try:
+                                parsed_datetime = datetime.strptime(
+                                    datetime_str,
+                                    "%Y-%m-%d %H:%M",
+                                )
+                                month_names = (
+                                    "", "Ocak", "Şubat", "Mart", "Nisan",
+                                    "Mayıs", "Haziran", "Temmuz", "Ağustos",
+                                    "Eylül", "Ekim", "Kasım", "Aralık",
+                                )
+                                confirmation_date = (
+                                    f"{parsed_datetime.day} "
+                                    f"{month_names[parsed_datetime.month]}"
+                                )
+                                confirmation_time = parsed_datetime.strftime("%H:%M")
+                            except ValueError:
+                                confirmation_date = datetime_str.split()[0]
+                                confirmation_time = datetime_str.split()[-1]
+                        assistant_text = (
+                            f"Randevunuz {confirmation_date}, {confirmation_time}, "
+                            f"{staff_name} için oluşturuldu."
+                        )
+                        forced_response = assistant_text
+                        self.booking_in_progress = False
+                        self.memory_date = None
+                        self.memory_date_label = None
+                        self.memory_time = None
+                        self.memory_service = None
+                        self.memory_staff = None
+                        self.history.append({"role": "system", "content": "SİSTEM BİLGİSİ: Randevu BAŞARIYLA oluşturuldu ve veritabanına kaydedildi. Müşteriye başka bir isteği olup olmadığını sor, yoksa vedalaşıp çağrıyı kapatmak için [KAPAT] etiketini kullan."})
+
+                # 3. İPTAL GİZLİ ETİKETİNİ YAKALA VE VERİTABANINA KAYDET
+                iptal_match = re.search(r"\[IPTAL:\s*([^\]]+)\]", assistant_text)
+                if iptal_match:
+                    apt_id = iptal_match.group(1).strip()
+                    logger.info("🗑️ LLM Randevu İptali Tetiklendi! ID: %s", apt_id)
+                    
+                    success = await VoiceToolExecutor.cancel_appointment(apt_id)
+                    if not success:
+                        assistant_text = "Randevunuzu iptal edemedim. Lütfen tekrar deneyin veya müşteri temsilcisine bağlanın."
+                    else:
+                        assistant_text = "Randevunuz başarıyla iptal edildi. Başka bir isteğiniz var mı?"
+                        self.history.append({"role": "system", "content": "SİSTEM BİLGİSİ: Randevu BAŞARIYLA iptal edildi."})
+                    forced_response = assistant_text
+
+                # 4. REVIZE GİZLİ ETİKETİNİ YAKALA
+                revize_match = re.search(r"\[REVIZE:\s*([^|]+)\|\s*([^|]+)\|\s*([^|]+)\|\s*([^\]]+)\]", assistant_text)
+                if revize_match:
+                    apt_id = revize_match.group(1).strip()
+                    new_date_str = revize_match.group(2).strip()
+                    new_staff_name = revize_match.group(3).strip()
+                    new_service_name = revize_match.group(4).strip()
+                    
+                    logger.info("🔄 LLM Randevu Revizesi Tetiklendi! ID: %s, Yeni Zaman: %s, Usta: %s, Hizmet: %s", apt_id, new_date_str, new_staff_name, new_service_name)
+                    
+                    result = await VoiceToolExecutor.reschedule_appointment(
+                        self.business_slug, 
+                        apt_id, 
+                        new_date_str,
+                        new_service_name,
+                        new_staff_name
+                    )
+                    if "error" in result:
+                        err = result["error"]
+                        logger.error("Randevu revize hatası: %s", err)
+                        if err == "slot_taken":
+                            assistant_text = "Üzgünüm, seçtiğiniz o saat az önce dolmuş veya ustanın başka bir randevusuyla çakışıyor. Lütfen farklı bir saat seçer misiniz?"
+                        elif err == "staff_cannot_perform_service":
+                            assistant_text = f"Üzgünüm, {new_staff_name} ustamız {new_service_name} işlemini yapmıyor. Başka bir ustayı tercih eder misiniz?"
+                        else:
+                            assistant_text = "Sistemde bir hata oluştu, randevunuzu değiştiremedim. Lütfen tekrar deneyin."
+                        self.history.append({"role": "system", "content": f"SİSTEM BİLGİSİ: Hata ({err})."})
+                    else:
+                        logger.info("✅ Randevu başarıyla revize edildi (ID: %s)", apt_id)
+                        assistant_text = assistant_text.replace(revize_match.group(0), "").strip()
+                        self.history.append({"role": "system", "content": "SİSTEM BİLGİSİ: Randevu başarıyla REVIZE EDİLDİ. Müşteriye başka bir isteği olup olmadığını sor, yoksa vedalaşıp çağrıyı kapatmak için [KAPAT] etiketini kullan."})
+                        self.booking_in_progress = False
+                        self.memory_date = None
+                        self.memory_date_label = None
+                        self.memory_time = None
+                        self.memory_service = None
+                        self.memory_staff = None
+                    
+                # 5. [KAPAT] Etiketi kontrolü
+                if "[KAPAT]" in assistant_text:
+                    logger.info("📞 LLM Çağrıyı Kapatma (KAPAT) komutu gönderdi.")
+                    self.is_session_closed = True
+                    assistant_text = assistant_text.replace("[KAPAT]", "").strip()
+
+                self.history.append({"role": "assistant", "content": assistant_text})
+                
+                # Eğer buffer'da kalan son metin varsa (noktalamasız bittiyse veya etiket temizlendikten sonra kaldıysa)
+                # Sadece etiket olmayan kısımları yield et
+                if forced_response:
+                    yield normalize_turkish_text(forced_response)
+                elif buffer:
+                    # Etiket regex temizliği
+                    clean_buffer = re.sub(r"\[.*?\]", "", buffer).strip()
+                    if clean_buffer:
+                        yield normalize_turkish_text(clean_buffer)
 
         except Exception as exc:
             logger.warning("LLM isteği başarısız oldu: %s", exc)
-            return normalize_turkish_text(await self._fallback_simulated_response(user_text))
+            yield normalize_turkish_text(await self._fallback_simulated_response(user_text))
 
     async def _fallback_simulated_response(self, user_text: str) -> str:
         """API anahtarı olmadığında konuşma hafızasıyla gün/saat/usta algılayıp veritabanı sorguları çalıştırır."""
@@ -454,8 +777,7 @@ class VoiceLLMEngine:
 
         # ADIM 1: İlk olarak usta seçimi sorulur (Eğer müşteri henüz usta belirtmediyse)
         if self.memory_staff is None:
-            staff_str = " mı, ".join([s.split()[0] + " usta" for s in db_staff]) if db_staff else "Mehmet usta mı, Yusuf usta"
-            return f"Hoş geldiniz! Hangi ustamız için randevu almak istersiniz? {staff_str} mı?"
+            return "Hoş geldiniz! Hangi ustamız için randevu almak istersiniz?"
 
         staff_short = f"{self.memory_staff.split()[0]} usta" if self.memory_staff else "Usta"
 
@@ -473,8 +795,7 @@ class VoiceLLMEngine:
                 filtered_services = [s for s in db_services if any(w in s.lower() for w in ["bakım", "maske", "cilt"])]
             
             if filtered_services:
-                services_str = ", ".join(filtered_services)
-                return f"{staff_short} için {services_str} hizmetlerimiz var. Hangisini tercih edersiniz?"
+                return f"{staff_short} için saç veya sakal gibi işlemlerimiz var. Hangi işlemi yaptırmak istersiniz?"
             
             # Eğer müşteri hizmetlerin ne olduğunu soruyorsa sayalım
             if any(w in lower_text for w in ["hangi", "neler", "ne", "liste", "seçenek"]):
@@ -514,7 +835,7 @@ class VoiceLLMEngine:
             if not slots:
                 return f"Maalesef {day_label} günü için {staff_short} hiç müsait saatimiz kalmamış. Farklı bir gün tercih eder misiniz?"
 
-            slot_info = ", ".join(slots[:4])
+            slot_info = format_available_slots(slots)
             return f"{staff_short} için {day_label} günü müsait saatler: {slot_info}. Hangi saati tercih edersiniz?"
 
         # ADIM 4: Müşteri hem USTAYI hem SAATİ net belirlediğinde randevuyu oluşturmayı dene
@@ -526,7 +847,7 @@ class VoiceLLMEngine:
             business_slug=self.business_slug,
             service_name=self.memory_service,
             staff_name=target_staff,
-            customer_phone="+905321112233",
+            customer_phone=self.customer_phone,
             customer_name="Yusuf Kantarcıoğlu",
             start_time_local=start_time_local,
         )

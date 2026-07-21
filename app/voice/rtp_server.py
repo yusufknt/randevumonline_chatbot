@@ -1,5 +1,5 @@
 """
-RTP ve SIP Sunucu Uygulaması (Asterisk olmadan)
+RTP ve SIP Sunucu Uygulaması (Asterisk olmadan) - Asenkron Pipeline Modeli
 """
 
 import asyncio
@@ -13,9 +13,6 @@ from app.voice.models import VoiceSession, SessionState
 logger = logging.getLogger(__name__)
 
 # G.711 A-Law ve U-Law için lookup tabloları ve decode/encode fonksiyonları
-# Python 3.13'te audioop kaldırıldığı için manuel olarak uygulandı.
-
-# A-Law Decoder Table (PCMA)
 ALAW_DECODE_TABLE = [0] * 256
 for i in range(256):
     alaw = i ^ 0x55
@@ -83,18 +80,15 @@ class RTPServerProtocol(asyncio.DatagramProtocol):
         import random
         self.ssrc = random.randint(10000, 999999)
         self._greeting_sent = False
-        
-        self.audio_buffer = bytearray()
-        self._silence_timer: asyncio.TimerHandle | None = None
-        self._is_speaking = False
-        self._silence_frames = 0
 
     def connection_made(self, transport):
         self.transport = transport
         logger.info("RTP Sunucusu başlatıldı ve bağlandı. Hedef: %s:%s", self.remote_ip, self.remote_port)
         
+        # Asenkron pipeline işçilerini başlat
+        self.pipeline.start(self.send_audio)
+        
         self._greeting_sent = False
-        # Çağrı bağlandıktan 1 saniye sonra karşılama mesajını otomatik gönder
         asyncio.create_task(self._delayed_greeting())
         
         # PBX'in çağrıyı düşürmesini engellemek için keepalive başlat
@@ -105,12 +99,11 @@ class RTPServerProtocol(asyncio.DatagramProtocol):
         while self.transport and not self.transport.is_closing():
             await asyncio.sleep(2.0)
             if self.pipeline.session.state == SessionState.PROCESSING:
-                # 40ms sessizlik paketi (ALAW'da 0xD5)
-                silence = b'\xd5' * 320
+                # PCMA/8000 için 20 ms = 160 bayt.
+                silence = b'\xd5' * 160
                 await self.send_audio(silence)
         
     async def _delayed_greeting(self):
-        # Bekleme süresi tamamen kaldırıldı, anında başlat.
         await self._send_greeting()
         
     async def _send_greeting(self):
@@ -128,48 +121,41 @@ class RTPServerProtocol(asyncio.DatagramProtocol):
                 logger.warning("⚠️ Hazır açılış sesi (%s) bulunamadı! Eski davranışa dönülüyor (Dinamik TTS)...", greeting_file)
                 greeting_text = "Merhaba. RandevumOnline yapay zeka asistanına hoş geldiniz. Size yardımcı olabilmem için lütfen randevu talebinizi söyleyebilirsiniz."
                 async for chunk in self.pipeline.tts.synthesize_stream(greeting_text):
+                    if self.pipeline.interrupt_event.is_set():
+                        logger.info("🛑 Barge-in: Dinamik açılış mesajı kesildi.")
+                        break
                     await self.send_audio(chunk)
                     await asyncio.sleep(len(chunk) / 8000.0)
-                logger.info("✅ Dinamik açılış sesi müşteriye iletildi.")
-                self.pipeline.session.update_state(SessionState.LISTENING)
+                
+                if not self.pipeline.interrupt_event.is_set():
+                    logger.info("✅ Dinamik açılış sesi müşteriye iletildi.")
+                    self.pipeline.session.update_state(SessionState.LISTENING)
                 return
                     
             logger.info("🎵 Hazır açılış sesi (%s) ağa gönderiliyor...", greeting_file)
             with open(greeting_file, "rb") as f:
                 alaw_data = f.read()
                 
-            chunk_size = 320
+            # Karşı tarafın SDP'de istediği ptime=20 değerine uy:
+            # PCMA/8000 sesinde 20 ms RTP payload'u 160 bayttır.
+            chunk_size = 160
             for i in range(0, len(alaw_data), chunk_size):
+                if self.pipeline.interrupt_event.is_set():
+                    logger.info("🛑 Barge-in: Hazır açılış mesajı kesildi.")
+                    break
                 chunk = alaw_data[i:i+chunk_size]
                 if not chunk:
                     break
                 await self.send_audio(chunk)
                 await asyncio.sleep(len(chunk) / 8000.0)
                 
-            logger.info("✅ Hazır açılış sesi müşteriye başarıyla iletildi. Normal STT dinleme moduna geçiliyor.")
-            
-            if self.pipeline.session.state == SessionState.SPEAKING:
+            if not self.pipeline.interrupt_event.is_set():
+                logger.info("✅ Hazır açılış sesi müşteriye başarıyla iletildi. Normal STT dinleme moduna geçiliyor.")
                 self.pipeline.session.update_state(SessionState.LISTENING)
+                
         except Exception as e:
             logger.error("Greeting hatası: %s", e)
             self.pipeline.session.update_state(SessionState.LISTENING)
-
-    def _process_buffered_audio(self):
-        if not self.audio_buffer:
-            return
-        
-        # Buffer kopyasını al ve temizle
-        audio_data = bytes(self.audio_buffer)
-        self.audio_buffer.clear()
-        
-        if len(audio_data) >= 8000: # En az 0.5 saniye ses
-            logger.info("🎙️ Müşteri konuşması bitti, STT'ye gönderiliyor. (%d bytes)", len(audio_data))
-            asyncio.create_task(
-                self.pipeline.handle_incoming_audio(
-                    audio_data,
-                    self.send_audio
-                )
-            )
 
     def datagram_received(self, data, addr):
         # Update remote IP and port for symmetric RTP
@@ -186,31 +172,10 @@ class RTPServerProtocol(asyncio.DatagramProtocol):
         payload_type = data[1] & 0x7F
         # Sadece PCMA (A-Law) = 8
         if payload_type == 8:
-            # Asistan konuşurken müşteri sesini YÖKSAY (Half-Duplex mod - Barge-in kapalı)
-            if self.pipeline.session.state == SessionState.SPEAKING:
-                return
-                
             payload = data[12:]
             pcm_audio = alaw2lin(payload)
-            
-            # Enerji hesabı (Ses Şiddeti)
-            samples = struct.unpack(f"<{len(pcm_audio)//2}h", pcm_audio)
-            energy = sum(abs(s) for s in samples) / len(samples)
-            
-            # Ses aktivitesi (VAD) mantığı
-            if energy > 3000:
-                self._is_speaking = True
-                self._silence_frames = 0
-                self.audio_buffer.extend(pcm_audio)
-            elif self._is_speaking:
-                # Konuşma devam ederken aradaki kısa sessizlikler (kelime araları)
-                self.audio_buffer.extend(pcm_audio)
-                self._silence_frames += 1
-                
-                # 100 frame (2 saniye) kesintisiz sessizlik olursa konuşma bitti say (müşteri yavaş konuşabilir)
-                if self._silence_frames > 100:
-                    self._is_speaking = False
-                    self._process_buffered_audio()
+            # Tüm paketleri pipeline'ın audio worker'ına (queue'ya) at
+            self.pipeline.feed_audio(pcm_audio)
 
     async def send_audio(self, pcm_data: bytes) -> None:
         """Pipeline tarafından üretilen ALAW verisini doğrudan yollar."""

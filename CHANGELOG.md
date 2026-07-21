@@ -11,6 +11,7 @@ Tüm önemli değişiklikler bu dosyada belgelenecektir.
   - `AudioSocketServer` (TCP 8010), FastAPI'nin `lifespan` olaylarına dahil edildi, böylece uygulama başladığında ses botu arka planda otomatik olarak dinlemeye başlıyor.
   - Canlı çağrılar ve NetGSM testleri için `pipeline.py` ve `audio_socket.py` içine daha detaylı (barge-in, LLM ve TTS durumları) debug logları eklendi.
 - **Hazır Karşılama Sesi (Zero-Delay Startup)**: Telefon açıldığında LLM/TTS bekleme süreleri (30-40 sn) tamamen ortadan kaldırıldı. Asistan çağrıyı yanıtlar yanıtlamaz, projeye eklenen hazır `.alaw` (G.711) ses dosyası ağa aktarılıyor ve sıfır gecikmeyle karşılama yapıyor.
+  - *Güncelleme (Faz 4)*: Karşılama metni "Merhaba. Berber Mehmet'e hoş geldiniz. Size yardımcı olabilmem için lütfen randevu talebinizi söyleyebilir misiniz" olarak yenilendi. Eski genel karşılama silindi.
 
 ### Changed (Değiştirilenler)
 - **Telsiz Mantığı (Half-Duplex) Geçişi**: Barge-in (söz kesme) mimarisi projeden tamamen silindi. Asistan konuşurken gelen tüm müşteri ses paketleri kasıtlı olarak yoksayılıyor. Böylece arka plan gürültüsüyle asistanın cümlesinin yarıda kesilmesi problemi kökünden çözüldü. Müşteri, ancak asistan konuşmasını tamamladığında (LISTENING modu) dinleniyor.

@@ -1,158 +1,179 @@
-"""
-FAZ 2 - Yazıyı Sese Çevirme (Text-To-Speech / TTS) Motoru.
-
-Bu modül, asistanın LLM tarafından üretilen kısa Türkçe metin cevaplarını
-Asterisk santralinin beklediği 8kHz 16-bit mono PCM ses akışına (bytes) dönüştürür.
-"""
-
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
-from typing import AsyncIterator
+from asyncio.subprocess import PIPE
+from pathlib import Path
+from typing import AsyncIterable, AsyncIterator
 
-from app.voice.config import get_voice_settings
+import httpx
 
-logger = logging.getLogger(__name__)
+from app.voice.config import VoiceSettings, get_voice_settings
+
+log = logging.getLogger(__name__)
 
 
 class TextToSpeechEngine:
-    """Metni gerçek zamanlı ses paketlerine çeviren asenkron TTS motoru."""
+    """Mevcut Voice API sesini değiştirmeden PCM olarak yayınlayan motor."""
 
-    def __init__(self, sample_rate: int | None = None) -> None:
-        settings = get_voice_settings()
-        self.sample_rate = sample_rate or settings.voice_sample_rate
+    _client: httpx.AsyncClient | None = None
 
-    async def synthesize_stream(self, text: str) -> AsyncIterator[bytes]:
-        """Metni ses paketlerine dönüştürür ve parça parça (chunk) stream eder.
+    @classmethod
+    async def startup(cls) -> None:
+        if cls._client is None:
+            cls._client = httpx.AsyncClient(
+                timeout=httpx.Timeout(connect=5, read=60, write=10, pool=5),
+                limits=httpx.Limits(max_connections=6, max_keepalive_connections=3),
+                http2=False,
+            )
 
-        Her bir parça Asterisk çerçeve boyutuna (320 bayt = 20ms ses) uygun paketlenir.
-        """
-        if not text.strip():
-            return
-
-        pcm_data = await asyncio.to_thread(self._synthesize_pcm, text)
-
-        frame_size = get_voice_settings().voice_frame_size
-        for i in range(0, len(pcm_data), frame_size):
-            chunk = pcm_data[i : i + frame_size]
-            if chunk:
-                yield chunk
-
-    def _synthesize_pcm(self, text: str) -> bytes:
-        """Metni 8kHz 16-bit PCM formatına dönüştürür."""
-        settings = get_voice_settings()
-        
-        # 1. Yeni Voice API'yi Dene
-        if settings.tts_api_key and settings.tts_api_base_url:
-            try:
-                return self._run_voiceapi_tts(text, settings)
-            except Exception as e:
-                logger.error(f"Voice API (TTS) basarisiz oldu: {e}, fallback: edge-tts")
-        
-        # 2. Fallback: Edge TTS
-        try:
-            return self._run_edge_tts(text)
-        except Exception:
-            try:
-                return self._run_piper_tts(text)
-            except Exception:
-                duration_s = min(max(len(text) * 0.06, 0.5), 3.0)
-                sample_count = int(self.sample_rate * duration_s)
-                return b"\x00\x00" * sample_count
-
-    def _run_voiceapi_tts(self, text: str, settings: "VoiceSettings") -> bytes:
-        """Yeni Voice API üzerinden ses sentezleyip 8kHz 16-bit PCM formatına çevirir."""
-        import httpx
-        import subprocess
-        import tempfile
-        import os
-
-        base_url = settings.tts_api_base_url.rstrip('/')
-        auth_url = f"{base_url}/auth"
-        create_url = f"{base_url}/createvoice"
-
-        # httpx client'ı cookie (session) desteğiyle ve uzun timeout ile açıyoruz
-        with httpx.Client(timeout=60.0) as client:
-            # 1. Oturum aç
-            auth_response = client.post(auth_url, json={"key": settings.tts_api_key})
-            auth_response.raise_for_status()
-
-            # 2. Sesi oluştur
-            payload = {
-                "metin": text,
-                "language": "tr",
-                "cinsiyet": settings.tts_api_gender,
-                "sestype": settings.tts_api_emotion,
-                "exaggeration": 0.5,
-                "cfg_weight": 0.5,
-                "temperature": 0.8
-            }
-            response = client.post(create_url, json=payload)
-            response.raise_for_status()
-            audio_bytes = response.content
-        
-        with tempfile.NamedTemporaryFile(suffix=".audio", delete=False) as audio_f:
-            audio_path = audio_f.name
-            audio_f.write(audio_bytes)
-            
-        with tempfile.NamedTemporaryFile(suffix=".raw", delete=False) as raw_f:
-            raw_path = raw_f.name
-
-        try:
-            subprocess.run([
-                "ffmpeg", "-y", "-i", audio_path,
-                "-f", "alaw", "-ar", "8000", "-ac", "1",
-                raw_path
-            ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-            with open(raw_path, "rb") as f:
-                return f.read()
-        finally:
-            for p in (audio_path, raw_path):
-                if os.path.exists(p):
-                    try:
-                        os.remove(p)
-                    except OSError:
-                        pass
-
-    def _run_edge_tts(self, text: str) -> bytes:
-        """Edge Neural TTS ile ses sentezleyip 8kHz 16-bit PCM formatına çevirir."""
-        import subprocess
-        import tempfile
-        import edge_tts
-
-        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as mp3_f:
-            mp3_path = mp3_f.name
-        with tempfile.NamedTemporaryFile(suffix=".raw", delete=False) as raw_f:
-            raw_path = raw_f.name
-
-        try:
-            async def _synth():
-                c = edge_tts.Communicate(text, "tr-TR-EmelNeural")
-                await c.save(mp3_path)
-
-            asyncio.run(_synth())
-
-            subprocess.run([
-                "ffmpeg", "-y", "-i", mp3_path,
-                "-f", "alaw", "-ar", "8000", "-ac", "1",
-                raw_path
-            ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-            with open(raw_path, "rb") as f:
-                return f.read()
-        finally:
-            for p in (mp3_path, raw_path):
-                import os
-                if os.path.exists(p):
-                    try:
-                        os.remove(p)
-                    except OSError:
-                        pass
+    @classmethod
+    async def shutdown(cls) -> None:
+        if cls._client:
+            await cls._client.aclose()
+            cls._client = None
 
     @staticmethod
-    def _run_piper_tts(text: str) -> bytes:
-        """Piper TTS üzerinden ses sentezlemeye çalışır."""
-        raise NotImplementedError("Piper TTS henüz kurulmadı")
+    def _auth(settings: VoiceSettings) -> tuple[dict[str, str], dict[str, str]]:
+        cookie_file = (
+            Path(settings.tts_cookie_file).expanduser()
+            if settings.tts_cookie_file else None
+        )
+        if cookie_file and cookie_file.is_file():
+            # Netscape cookie dosyasından yalnızca gerekli cookie çifti okunur.
+            cookies: dict[str, str] = {}
+            for line in cookie_file.read_text(errors="ignore").splitlines():
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split("\t")
+                if len(parts) >= 7:
+                    cookies[parts[-2]] = parts[-1]
+            if cookies:
+                return {}, cookies
+        if settings.tts_api_key:
+            return {}, {"authorization": settings.tts_api_key}
+        raise RuntimeError("TTS kimlik doğrulaması eksik")
 
+    @staticmethod
+    def _payload(text: str, settings: VoiceSettings) -> dict:
+        # Mevcut createvoice/stream sözleşmesi bilerek aynen korunuyor.
+        return {
+            "metin": text,
+            "language": "tr",
+            "cinsiyet": settings.tts_api_gender,
+            "sestype": settings.tts_api_emotion,
+            "exaggeration": 0.5,
+            "cfg_weight": 0.5,
+            "temperature": 0.8,
+        }
+
+    async def _voice_api_audio(
+        self, text: str, settings: VoiceSettings
+    ) -> AsyncIterator[bytes]:
+        await self.startup()
+        assert self._client is not None
+        headers, cookies = self._auth(settings)
+        url = f"{settings.tts_api_base_url.rstrip('/')}/createvoice/stream"
+        request = self._client.build_request(
+            "POST",
+            url,
+            headers=headers,
+            cookies=cookies,
+            json=self._payload(text, settings),
+        )
+        response = await self._client.send(request, stream=True)
+        try:
+            response.raise_for_status()
+            async for chunk in response.aiter_bytes(4096):
+                if chunk:
+                    yield chunk
+        finally:
+            await response.aclose()
+
+    @staticmethod
+    async def _decode_mp3(source: AsyncIterable[bytes]) -> AsyncIterator[bytes]:
+        """MP3 byte akışını AudioSocket'un 8 kHz signed-linear biçimine çevirir."""
+        ffmpeg = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-f", "mp3", "-i", "pipe:0",
+            "-f", "s16le", "-ar", "8000", "-ac", "1", "pipe:1",
+            stdin=PIPE, stdout=PIPE, stderr=asyncio.subprocess.DEVNULL,
+        )
+        feed_task: asyncio.Task | None = None
+        try:
+            async def feed() -> None:
+                try:
+                    async for chunk in source:
+                        if ffmpeg.stdin is None:
+                            break
+                        ffmpeg.stdin.write(chunk)
+                        await ffmpeg.stdin.drain()
+                finally:
+                    if ffmpeg.stdin:
+                        ffmpeg.stdin.close()
+
+            feed_task = asyncio.create_task(feed())
+            assert ffmpeg.stdout is not None
+            buffer = bytearray()
+            while True:
+                chunk = await ffmpeg.stdout.read(320 - len(buffer))
+                if not chunk:
+                    break
+                buffer.extend(chunk)
+                if len(buffer) == 320:
+                    yield bytes(buffer)
+                    buffer.clear()
+            if buffer:
+                buffer.extend(b"\x00" * (320 - len(buffer)))
+                yield bytes(buffer)
+            await feed_task
+            code = await ffmpeg.wait()
+            if code != 0:
+                raise RuntimeError(f"TTS dönüştürme başarısız code={code}")
+        finally:
+            if feed_task and not feed_task.done():
+                feed_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await feed_task
+            if ffmpeg.returncode is None:
+                ffmpeg.kill()
+            with contextlib.suppress(Exception):
+                await ffmpeg.wait()
+
+    async def synthesize_stream(self, text: str) -> AsyncIterator[bytes]:
+        if not text.strip():
+            return
+        settings = get_voice_settings()
+
+        # Upstream bazen yalnızca ID3 başlığı gönderip chunked gövdeyi yarıda
+        # kapatıyor. Farklı bir konuşmacı sesi kullanmak marka sesini bozduğu
+        # için yalnızca yapılandırılmış ana sağlayıcıya istek yapılır.
+        for attempt in (1,):
+            emitted = 0
+            try:
+                async for chunk in self._decode_mp3(
+                    self._voice_api_audio(text, settings)
+                ):
+                    emitted += 1
+                    yield chunk
+                if emitted:
+                    return
+            except (httpx.HTTPError, OSError, RuntimeError) as exc:
+                if emitted:
+                    log.warning(
+                        "Voice API ses gövdesi kısmi kapandı; üretilen PCM korundu "
+                        "type=%s chunks=%d",
+                        type(exc).__name__,
+                        emitted,
+                    )
+                    return
+                log.warning(
+                    "Voice API ses üretmedi attempt=%d type=%s",
+                    attempt,
+                    type(exc).__name__,
+                )
+
+        log.error(
+            "Voice API kullanılamıyor; farklı konuşmacı sesi yedeği devre dışı"
+        )

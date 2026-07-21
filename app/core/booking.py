@@ -6,8 +6,10 @@ from decimal import Decimal
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from bson import ObjectId
 from bson.decimal128 import Decimal128
 from motor.motor_asyncio import AsyncIOMotorDatabase
+from pymongo.errors import DuplicateKeyError
 
 from app.core.availability import (
     WEEKDAY_NAMES,
@@ -17,6 +19,56 @@ from app.core.availability import (
 from app.core.format import local_iso, money_str
 
 log = logging.getLogger(__name__)
+
+
+def _guard_ids(
+    business_id: ObjectId,
+    staff_id: ObjectId,
+    start_utc: datetime,
+    end_utc: datetime,
+) -> list[str]:
+    cursor = start_utc.replace(second=0, microsecond=0)
+    cursor -= timedelta(minutes=cursor.minute % 5)
+    keys: list[str] = []
+    while cursor < end_utc:
+        keys.append(f"{business_id}:{staff_id}:{int(cursor.timestamp())}")
+        cursor += timedelta(minutes=5)
+    return keys
+
+
+async def _reserve_guards(
+    db: AsyncIOMotorDatabase,
+    appointment_id: ObjectId,
+    business_id: ObjectId,
+    staff_id: ObjectId,
+    start_utc: datetime,
+    end_utc: datetime,
+) -> list[str] | None:
+    """Standalone MongoDB'de de eşzamanlı çakışmayı engelleyen dilim kilidi."""
+    keys = _guard_ids(business_id, staff_id, start_utc, end_utc)
+    inserted: list[str] = []
+    try:
+        for key in keys:
+            current = await db.appointment_guards.find_one({"_id": key}, {"owner": 1})
+            if current:
+                if current.get("owner") == appointment_id:
+                    continue
+                raise DuplicateKeyError("slot reserved")
+            await db.appointment_guards.insert_one({
+                "_id": key,
+                "owner": appointment_id,
+                "business_id": business_id,
+                "staff_id": staff_id,
+                "created_at": datetime.now(timezone.utc),
+            })
+            inserted.append(key)
+    except DuplicateKeyError:
+        if inserted:
+            await db.appointment_guards.delete_many(
+                {"_id": {"$in": inserted}, "owner": appointment_id}
+            )
+        return None
+    return keys
 
 
 def _to_money_decimal128(v: Any) -> Decimal128:
@@ -83,6 +135,12 @@ async def create_appointment(
         room_id = free["room_id"]
 
     now = datetime.now(timezone.utc)
+    appointment_id = ObjectId()
+    guard_ids = await _reserve_guards(
+        db, appointment_id, business["_id"], staff["_id"], start_utc, end_utc
+    )
+    if guard_ids is None:
+        return {"error": "slot_taken"}
     price = _to_money_decimal128(service["price"])
     doc = {
         "business_id": business["_id"],
@@ -109,7 +167,12 @@ async def create_appointment(
         "created_at": now,
         "updated_at": now,
     }
-    res = await db.appointments.insert_one(doc)
+    doc["_id"] = appointment_id
+    try:
+        res = await db.appointments.insert_one(doc)
+    except Exception:
+        await db.appointment_guards.delete_many({"owner": appointment_id})
+        raise
 
     await db.customers.update_one(
         {"_id": customer["_id"]},
@@ -182,16 +245,25 @@ async def cancel_appointment(
     appointment_id: str,
     reason: str = "customer_cancelled"
 ) -> bool:
-    from bson.objectid import ObjectId
     try:
         oid = ObjectId(appointment_id)
     except Exception:
         return False
 
-    res = await db.appointments.delete_one(
-        {"_id": oid, "status": {"$in": ["pending", "confirmed"]}}
+    now = datetime.now(timezone.utc)
+    res = await db.appointments.update_one(
+        {"_id": oid, "status": {"$in": ["pending", "confirmed"]}},
+        {"$set": {
+            "status": "cancelled",
+            "cancelled_reason": reason,
+            "cancelled_at": now,
+            "updated_at": now,
+        }},
     )
-    return res.deleted_count > 0
+    if res.modified_count:
+        await db.appointment_guards.delete_many({"owner": oid})
+        return True
+    return False
 
 
 async def reschedule_appointment(
@@ -202,7 +274,6 @@ async def reschedule_appointment(
     new_service: dict | None = None,
     new_staff: dict | None = None,
 ) -> dict:
-    from bson.objectid import ObjectId
     try:
         oid = ObjectId(appointment_id)
     except Exception:
@@ -250,6 +321,12 @@ async def reschedule_appointment(
     if conflict:
         return {"error": "slot_taken"}
 
+    guard_ids = await _reserve_guards(
+        db, oid, apt["business_id"], target_staff_id, target_start_utc, target_end_utc
+    )
+    if guard_ids is None:
+        return {"error": "slot_taken"}
+
     update_data = {
         "start_time": target_start_utc,
         "end_time": target_end_utc,
@@ -260,6 +337,9 @@ async def reschedule_appointment(
     }
 
     await db.appointments.update_one({"_id": oid}, {"$set": update_data})
+    await db.appointment_guards.delete_many(
+        {"owner": oid, "_id": {"$nin": guard_ids}}
+    )
 
     return {
         "status": "rescheduled",

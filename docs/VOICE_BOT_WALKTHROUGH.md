@@ -98,7 +98,7 @@ python3 -m scripts.test_voice_live_mic
 ### 4.2 Veritabanı Özet Görüntüleyici (`scripts/show_db.py`)
 Docker konteyneri içerisindeki işletmeleri, müşterileri ve alınan randevuları tek komutla tablo halinde listelemek için:
 ```bash
-docker exec randevum_api python -m scripts.show_db
+.venv/bin/python3 -m scripts.show_db
 ```
 
 **Örnek Çıktı:**
@@ -129,11 +129,12 @@ docker exec randevum_api python -m scripts.show_db
 - ✅ **Detaylı Raporlama:** `show_db.py` betiği randevuları Türkiye saati (+3), müşteri adı, usta adı ve hizmet bilgileriyle birlikte detaylı tablo olarak sunmaktadır.
 - ✅ **Statik Tip Güvenliği (`0 errors, 0 warnings`):** Ses modülü (`app/voice/`) ve çekirdek yapay zeka katmanındaki tüm eksik tip anotasyonları (`Any`) ile olası null erişim riski taşıyan noktalar giderilmiştir.
 - ✅ **Clean Repository:** Geçici ses dosyaları temizlenmiş ve `.gitignore` dosyasına `*.wav` eklenerek projenin temizliği garanti altına alınmıştır.
+- ✅ **Full Duplex / Barge-In (Faz 3):** Asenkron Queue yapısı sayesinde, AI konuşurken dahi kullanıcı sesi algılandığında TTS susturulmakta ve kesintisiz, doğal bir diyalog sağlanmaktadır.
+- ✅ **Graceful SIP Call Termination (Faz 4):** Asistan görüşmeyi bitirme kararı aldığında, ses paketlerinin tamamen gönderilmesi için bekleme (1sn) yapar. Sonrasında SIP `BYE` sinyali gönderip santralden `200 OK` onayı bekleyerek çağrıyı pürüzsüz ve güvenli bir şekilde kapatır.
 
 ### Hızlı Komut Referansı
 ```bash
-python3 -m scripts.test_voice_live_mic
-docker exec randevum_api python -m scripts.show_db
-#.venv/bin/python3 -m scripts.show_db
-
+.venv/bin/python3 -m scripts.test_voice_live_mic
+.venv/bin/python3 -m scripts.show_db
+.venv/bin/python3 -m scripts.run_voice_server
 ```

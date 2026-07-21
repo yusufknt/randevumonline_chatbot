@@ -59,6 +59,7 @@ class Channel(str, Enum):
     INSTAGRAM = "instagram"
     WEB = "web"
     MANUAL = "manual"
+    VOICE = "voice"
 
 
 class AppointmentStatus(str, Enum):
@@ -141,9 +142,15 @@ class InstagramChannelConfig(BaseModel):
     access_token_ref: str | None = None
 
 
+class VoiceChannelConfig(BaseModel):
+    enabled: bool = False
+    dids: list[str] = []
+
+
 class ChannelConfigs(BaseModel):
     whatsapp: WhatsAppChannelConfig = WhatsAppChannelConfig()
     instagram: InstagramChannelConfig = InstagramChannelConfig()
+    voice: VoiceChannelConfig = VoiceChannelConfig()
 
 
 class AISettings(BaseModel):

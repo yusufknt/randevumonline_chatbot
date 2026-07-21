@@ -1,96 +1,171 @@
-"""
-FAZ 2 - Sesi Yazıya Çevirme (Speech-To-Text / STT) ve Ses Etkinlik Algılama (VAD) Motoru.
-
-Bu modül, Asterisk'ten stream edilen 8kHz 16-bit PCM ses akışında konuşma bitimini (sessizlik)
-algılar ve faster-whisper (veya temiz simülasyon motoru) ile Türkçe metne dönüştürür.
-"""
-
 from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Protocol
+import re
+from dataclasses import dataclass
+
+import numpy as np
+import soxr
+from faster_whisper import WhisperModel
 
 from app.voice.config import get_voice_settings
 
-logger = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
 
 
-class SpeechToTextProtocol(Protocol):
-    """STT motorları için arayüz protokolü."""
+@dataclass(slots=True)
+class Transcript:
+    text: str
+    confidence: float
+    model: str
+    no_speech_probability: float = 1.0
+    compression_ratio: float = 0.0
 
-    async def transcribe(self, pcm_audio: bytes) -> str:
-        ...
+
+def _looks_like_hallucination(text: str, audio_seconds: float) -> bool:
+    """Telefon gürültüsünden üretilen tekrarlı Whisper metinlerini reddeder."""
+    words = re.findall(r"\w+", text.casefold(), flags=re.UNICODE)
+    if not words:
+        return False
+    if len(words) >= 8:
+        unique_ratio = len(set(words)) / len(words)
+        most_repeated = max(words.count(word) for word in set(words))
+        if unique_ratio < 0.35 or most_repeated >= 5:
+            return True
+    # Bir saniyeden kısa sesten paragraf çıkması gerçek konuşma değildir.
+    return audio_seconds < 1.0 and len(text) > 80
 
 
 class SpeechToTextEngine:
-    """Ses akışını işleyip konuşmayı metne çeviren asenkron STT motoru."""
+    """Bir kez ısınan, tüm çağrıların paylaştığı CPU-int8 Whisper motoru."""
 
-    def __init__(self, sample_rate: int | None = None) -> None:
-        settings = get_voice_settings()
-        self.sample_rate = sample_rate or settings.voice_sample_rate
-        self._whisper_model = None
-        self._load_lock = asyncio.Lock()
+    _fast: WhisperModel | None = None
+    _accurate: WhisperModel | None = None
+    _load_lock = asyncio.Lock()
+    _fast_sem: asyncio.Semaphore | None = None
+    _accurate_sem: asyncio.Semaphore | None = None
 
-    async def transcribe(self, pcm_audio: bytes) -> str:
-        """Gelen PCM ses verisini metne dönüştürür.
+    def __init__(self) -> None:
+        cfg = get_voice_settings()
+        if self.__class__._fast_sem is None:
+            self.__class__._fast_sem = asyncio.Semaphore(cfg.voice_stt_fast_workers)
+            self.__class__._accurate_sem = asyncio.Semaphore(cfg.voice_stt_accurate_workers)
 
-        Eğer ortamda GPU/faster-whisper modeli yüklü değilse, geliştirme ve test
-        için hatasız simülasyon yanıtı verir.
-        """
-        if not pcm_audio:
-            return ""
+    async def warmup(self) -> None:
+        await self._ensure_models()
+        silence = np.zeros(1600, dtype=np.float32)
+        await asyncio.to_thread(self._run, self._fast, silence, "tiny", None)
 
-        # Gürültü/kısa ses filtresi (minimum 100ms ses = 1600 bayt @ 8kHz 16-bit)
-        if len(pcm_audio) < 1600:
-            logger.debug("Çok kısa ses parçası yoksayıldı (%s bayt)", len(pcm_audio))
-            return ""
-
-        try:
-            # faster-whisper yüklüyse modeli asenkron olarak çalıştır
-            return await asyncio.to_thread(self._transcribe_sync, pcm_audio)
-        except Exception as exc:
-            logger.warning("faster-whisper çevirisi başarısız oldu: %s — yedek işleyici çalıştı", exc)
-            return ""
-
-    def _transcribe_sync(self, pcm_audio: bytes) -> str:
-        """Senkron STT çevirisi gerçekleştirir."""
-        try:
-            from faster_whisper import WhisperModel  # type: ignore
-
-            if self._whisper_model is None:
-                logger.info("faster-whisper modeli yükleniyor (small)...")
-                self._whisper_model = WhisperModel("small", device="cpu", compute_type="int8")
-
-            import tempfile
-            import wave
-            import os
-
-            # Whisper 16kHz bekler. Biz 8kHz pcm kullanıyoruz. 
-            # wave dosyasına yazıp verirsek, Whisper otomatik olarak 16kHz'e resample eder.
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_f:
-                tmp_path = tmp_f.name
-                
-            try:
-                with wave.open(tmp_path, "wb") as wav_file:
-                    wav_file.setnchannels(1)
-                    wav_file.setsampwidth(2) # 16-bit
-                    wav_file.setframerate(self.sample_rate) # 8000 Hz
-                    wav_file.writeframes(pcm_audio)
-                    
-                segments, _ = self._whisper_model.transcribe(
-                    tmp_path,
-                    language="tr",
-                    vad_filter=True,
+    async def _ensure_models(self) -> None:
+        async with self._load_lock:
+            cfg = get_voice_settings()
+            if self.__class__._fast is None:
+                log.info("Yerel hızlı STT modeli yükleniyor model=%s", cfg.voice_stt_fast_model)
+                self.__class__._fast = await asyncio.to_thread(
+                    WhisperModel,
+                    cfg.voice_stt_fast_model,
+                    device="cpu",
+                    compute_type="int8",
+                    cpu_threads=2,
+                    num_workers=2,
+                    local_files_only=True,
                 )
-                text = " ".join(segment.text.strip() for segment in segments)
-                return text
-            finally:
-                if os.path.exists(tmp_path):
-                    try:
-                        os.remove(tmp_path)
-                    except OSError:
-                        pass
-        except ImportError:
-            # faster_whisper veya numpy kurulu değilse test simülasyonu dön
-            return "Merhaba randevu almak istiyorum"
+            if self.__class__._accurate is None:
+                if cfg.voice_stt_accurate_model == cfg.voice_stt_fast_model:
+                    self.__class__._accurate = self.__class__._fast
+                else:
+                    log.info(
+                        "Yerel doğrulama STT modeli yükleniyor model=%s",
+                        cfg.voice_stt_accurate_model,
+                    )
+                    self.__class__._accurate = await asyncio.to_thread(
+                        WhisperModel,
+                        cfg.voice_stt_accurate_model,
+                        device="cpu",
+                        compute_type="int8",
+                        cpu_threads=4,
+                        num_workers=1,
+                        local_files_only=True,
+                    )
+
+    @staticmethod
+    def _to_16k(pcm: bytes) -> np.ndarray:
+        samples = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
+        return soxr.resample(samples, 8000, 16000, quality="HQ").astype(np.float32)
+
+    @staticmethod
+    def _run(
+        model: WhisperModel | None,
+        audio: np.ndarray,
+        label: str,
+        domain_prompt: str | None,
+    ) -> Transcript:
+        if model is None:
+            return Transcript("", 0.0, label)
+        segments, _ = model.transcribe(
+            audio,
+            language="tr",
+            beam_size=5,
+            best_of=5,
+            vad_filter=False,
+            condition_on_previous_text=False,
+            temperature=0,
+            repetition_penalty=1.12,
+            no_repeat_ngram_size=3,
+            compression_ratio_threshold=2.2,
+            log_prob_threshold=-1.0,
+            no_speech_threshold=0.55,
+            hotwords=domain_prompt,
+            initial_prompt=(
+                "Türkçe bir telefon görüşmesi yazıya çevriliyor. Müşteri bir "
+                "berberden randevu, hizmet, gün veya saat isteyebilir."
+            ),
+        )
+        items = list(segments)
+        text = " ".join(item.text.strip() for item in items).strip()
+        if not items:
+            return Transcript("", 0.0, label)
+        avg_logprob = sum(item.avg_logprob for item in items) / len(items)
+        confidence = max(0.0, min(1.0, 1.0 + avg_logprob))
+        no_speech = sum(item.no_speech_prob for item in items) / len(items)
+        compression = max(item.compression_ratio for item in items)
+        duration = len(audio) / 16000
+        if (
+            _looks_like_hallucination(text, duration)
+            or compression > 2.2
+            or (no_speech > 0.72 and confidence < 0.45)
+        ):
+            log.info(
+                "STT gürültü/halüsinasyon sonucu reddedildi model=%s "
+                "no_speech=%.2f compression=%.2f chars=%d",
+                label,
+                no_speech,
+                compression,
+                len(text),
+            )
+            return Transcript("", 0.0, label, no_speech, compression)
+        return Transcript(text, confidence, label, no_speech, compression)
+
+    async def transcribe(
+        self,
+        pcm: bytes,
+        accurate: bool = False,
+        domain_prompt: str | None = None,
+    ) -> Transcript:
+        if len(pcm) < 3200:
+            return Transcript("", 0.0, "none")
+        await self._ensure_models()
+        cfg = get_voice_settings()
+        audio = self._to_16k(pcm)
+        sem = self._accurate_sem if accurate else self._fast_sem
+        model = self._accurate if accurate else self._fast
+        assert sem is not None
+        async with sem:
+            return await asyncio.to_thread(
+                self._run,
+                model,
+                audio,
+                cfg.voice_stt_accurate_model if accurate else cfg.voice_stt_fast_model,
+                domain_prompt,
+            )

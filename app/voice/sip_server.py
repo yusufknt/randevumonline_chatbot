@@ -31,6 +31,15 @@ class SIPServerProtocol(asyncio.DatagramProtocol):
             asyncio.create_task(self.handle_invite(message, addr))
         elif message.startswith("BYE"):
             self.handle_bye(message, addr)
+        elif message.startswith("SIP/2.0 200 OK"):
+            cseq_match = re.search(r"CSeq:\s*(\d+)\s+BYE", message, re.IGNORECASE)
+            if cseq_match:
+                call_id_match = re.search(r"Call-ID:\s*(.+)", message, re.IGNORECASE)
+                if call_id_match:
+                    call_id = call_id_match.group(1).strip()
+                    logger.info("BYE acknowledged")
+                    if call_id in self.active_calls and "bye_ack_event" in self.active_calls[call_id]:
+                        self.active_calls[call_id]["bye_ack_event"].set()
         elif message.startswith("ACK"):
             logger.info("ACK Alındı")
 
@@ -55,14 +64,36 @@ class SIPServerProtocol(asyncio.DatagramProtocol):
         session = VoiceSession(session_id=call_id)
         pipeline = VoicePipeline(session=session)
         
-        def hangup_callback():
-            # BYE mesajını oluştur ve gönder
-            bye_msg = self.build_bye(message)
-            self.transport.sendto(bye_msg.encode('utf-8'), addr)
-            logger.info("👋 BYE gönderildi. Çağrı asistan tarafından sonlandırıldı.")
+        async def hangup_callback():
+            bye_msg = self.build_bye(message, local_ip)
+            
+            # BYE paketini doğrudan topmost Route (Proxy) adresine veya asıl addr'a yolla
+            dest_ip = addr[0]
+            dest_port = addr[1]
+            route_match = re.search(r"Route:\s*<sip:([^;>:]+)(?::(\d+))?", bye_msg, re.IGNORECASE)
+            if route_match:
+                dest_ip = route_match.group(1)
+                dest_port = int(route_match.group(2)) if route_match.group(2) else 5060
+                
+            logger.info("Sending SIP BYE to %s:%s:\n--- GÖNDERİLEN BYE MESAJI ---\n%s\n-----------------------------", dest_ip, dest_port, bye_msg.strip())
+            self.transport.sendto(bye_msg.encode('utf-8'), (dest_ip, dest_port))
+            
             if call_id in self.active_calls:
+                ack_event = asyncio.Event()
+                self.active_calls[call_id]["bye_ack_event"] = ack_event
+                
+                try:
+                    await asyncio.wait_for(ack_event.wait(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    logger.warning("BYE acknowledge timeout, terminating anyway.")
+                    
+                logger.info("RTP socket closed")
                 self.active_calls[call_id]["transport"].close()
                 del self.active_calls[call_id]
+                
+            pipeline.stop()
+            logger.info("Session destroyed")
+            logger.info("Call successfully terminated")
 
         pipeline.on_hangup = hangup_callback
         
@@ -141,33 +172,43 @@ class SIPServerProtocol(asyncio.DatagramProtocol):
         # Aslında 200 OK dönmemiz gerekir ama şu anki test ortamı için kritik değil.
         pass
 
-    def build_bye(self, invite_msg: str) -> str:
-        """Asistan tarafından çağrıyı kapatmak için BYE mesajı oluşturur."""
-        vias = re.findall(r"Via:\s*(.+)", invite_msg, re.IGNORECASE)
-        via_headers = "\r\n".join([f"Via: {v.strip()}" for v in vias])
-        
-        record_routes = re.findall(r"Record-Route:\s*(.+)", invite_msg, re.IGNORECASE)
-        rr_headers = "".join([f"Record-Route: {rr.strip()}\r\n" for rr in record_routes])
-        
+    def build_bye(self, invite_msg: str, local_ip: str = "127.0.0.1") -> str:
+        # Extract Request URI for BYE from Contact or From
+        contact_match = re.search(r"Contact:\s*<([^>]+)>", invite_msg, re.IGNORECASE)
+        if contact_match:
+            request_uri = contact_match.group(1).strip()
+        else:
+            from_match = re.search(r"From:\s*<([^>]+)>", invite_msg, re.IGNORECASE)
+            request_uri = from_match.group(1).strip() if from_match else "sip:unknown@unknown"
+            
         call_id = re.search(r"Call-ID:\s*(.+)", invite_msg, re.IGNORECASE).group(1).strip()
         from_hdr = re.search(r"From:\s*(.+)", invite_msg, re.IGNORECASE).group(1).strip()
         to_hdr = re.search(r"To:\s*(.+)", invite_msg, re.IGNORECASE).group(1).strip()
-        cseq_match = re.search(r"CSeq:\s*(\d+)", invite_msg, re.IGNORECASE)
-        cseq_num = int(cseq_match.group(1)) if cseq_match else 1
+        
+        record_routes = re.findall(r"Record-Route:\s*(.+)", invite_msg, re.IGNORECASE)
+        route_headers = "".join([f"Route: {rr.strip()}\r\n" for rr in reversed(record_routes)])
         
         # tag yoksa ekleyelim
         if ";tag=" not in to_hdr:
             to_hdr += ";tag=12345"
             
-        # BYE için From ve To yer değiştirir, ancak CSeq artar.
+        import random
+        branch = f"z9hG4bK{random.randint(100000, 999999)}"
+        via_header = f"Via: SIP/2.0/UDP {local_ip}:8010;rport;branch={branch}\r\n"
+        
+        # BYE için From ve To yer değiştirir.
+        # CSeq UAC için lokal bir değer olmalıdır, ilk request olduğu için 1 BYE yapıyoruz.
         response = (
-            f"BYE sip:asterisk@remote SIP/2.0\r\n"
-            f"{via_headers}\r\n"
-            f"{rr_headers}"
+            f"BYE {request_uri} SIP/2.0\r\n"
+            f"{via_header}"
+            f"Max-Forwards: 70\r\n"
+            f"{route_headers}"
             f"From: {to_hdr}\r\n"
             f"To: {from_hdr}\r\n"
             f"Call-ID: {call_id}\r\n"
-            f"CSeq: {cseq_num + 1} BYE\r\n"
+            f"CSeq: 1 BYE\r\n"
+            f"Contact: <sip:{local_ip}:8010>\r\n"
+            f"User-Agent: VoiceBot\r\n"
             f"Content-Length: 0\r\n\r\n"
         )
         return response
@@ -250,6 +291,7 @@ class SIPServerProtocol(asyncio.DatagramProtocol):
             f"m=audio {rtp_port} RTP/AVP 8 101\r\n"
             f"a=rtpmap:8 PCMA/8000\r\n"
             f"a=rtpmap:101 telephone-event/8000\r\n"
+            f"a=ptime:20\r\n"
             f"a=sendrecv\r\n"
         )
         

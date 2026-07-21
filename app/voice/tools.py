@@ -160,6 +160,9 @@ class VoiceToolExecutor:
         except ValueError:
             return {"error": "invalid_date_format"}
 
+        if target_date < date.today():
+            return {"error": "past_date"}
+
         slots = await find_first_available_slots(
             db=db,
             business=business,

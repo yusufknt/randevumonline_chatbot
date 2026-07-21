@@ -2,12 +2,10 @@ from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
-
 from fastapi import FastAPI
 
 from app.core.config import get_settings
 from app.core.db import close_client, get_client, init_indexes
-from app.voice.sip_server import SIPServerProtocol
 from app.voice.config import get_voice_settings
 from app.webhooks import router as webhooks_router
 
@@ -28,20 +26,8 @@ async def lifespan(app: FastAPI):
         log.info("MongoDB indexleri uygulandı")
     except Exception:
         log.exception("init_indexes başarısız — devam ediliyor")
-    # SIP Ses Sunucusunu (UDP 8010) başlat
-    import asyncio
-    voice_settings = get_voice_settings()
-    loop = asyncio.get_running_loop()
-    transport, protocol = await loop.create_datagram_endpoint(
-        lambda: SIPServerProtocol(),
-        local_addr=(voice_settings.voice_server_host, voice_settings.voice_server_port)
-    )
-    app.state.sip_transport = transport
-    app.state.sip_protocol = protocol
-
     yield
 
-    app.state.sip_transport.close()
     await close_client()
 
 
@@ -69,24 +55,22 @@ async def health_check() -> dict:
     except Exception:
         pass
 
-    # SIP Listener check
-    sip_listener_active = False
-    if hasattr(app.state, "sip_transport") and app.state.sip_transport is not None:
-        sip_listener_active = True
-
     # LLM (DeepSeek/Groq) Check
     llm_ok = bool(settings.deepseek_api_key)
     
     # TTS Check
-    tts_ok = bool(settings.tts_api_key)
+    tts_ok = not any(
+        item.startswith("TTS_") for item in settings.validate_critical_connections()
+    )
 
     # STT Check (Local whisper always ready if installed)
     stt_ok = True
 
     return {
-        "status": "ok" if (mongo_ok and sip_listener_active) else "error",
+        "status": "ok" if mongo_ok else "error",
         "bot_active": True,
-        "sip_listener_active": sip_listener_active,
+        "sip_listener_active": None,
+        "voice_service": "separate",
         "llm_connection_ready": llm_ok,
         "stt_engine_ready": stt_ok,
         "tts_engine_ready": tts_ok,
