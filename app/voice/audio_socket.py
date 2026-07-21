@@ -17,7 +17,7 @@ from app.voice.config import get_voice_settings
 from app.voice.dialog import DialogManager
 from app.voice.identity import normalize_phone
 from app.voice.registry import registry
-from app.voice.stt import SpeechToTextEngine
+from app.voice.stt import SpeechToTextEngine, choose_transcript, transcript_quality
 from app.voice.tts import TextToSpeechEngine
 from app.voice.vad import UtteranceSegmenter
 
@@ -77,6 +77,7 @@ class AudioSocketCall:
         self.frames_out = 0
         self.result = "completed"
         self.business_id = None
+        self.terminating = False
 
     async def run(self) -> None:
         context = await registry.wait(self.uuid)
@@ -101,6 +102,10 @@ class AudioSocketCall:
                 if packet_type != 0x10:
                     continue
                 self.frames_in += 1
+                # Başarılı işlemden sonra kapanış anonsu kesilmesin ve yeni bir
+                # STT/LLM turu başlamasın.
+                if self.terminating or (self.dialog and self.dialog.closed):
+                    continue
                 barge, utterances = self.segmenter.feed(
                     payload, bool(self.playback and not self.playback.done())
                 )
@@ -199,15 +204,32 @@ class AudioSocketCall:
         # artırır. Doğrulama modeli gerçekten farklıysa düşük güveni doğrula.
         cfg = get_voice_settings()
         if (
-            transcript.confidence < .25
+            transcript.confidence < cfg.voice_stt_accurate_confidence_threshold
             and len(pcm) >= 12800
             and cfg.voice_stt_accurate_model != cfg.voice_stt_fast_model
         ):
+            log.info(
+                "STT güçlü modelle doğrulanıyor uuid=%s fast_model=%s "
+                "confidence=%.2f",
+                self.uuid,
+                transcript.model,
+                transcript.confidence,
+            )
             accurate = await self.stt.transcribe(
                 pcm, accurate=True, domain_prompt=domain_prompt
             )
-            if accurate.text:
-                transcript = accurate
+            selected = choose_transcript(transcript, accurate, domain_prompt)
+            log.info(
+                "STT aday seçimi uuid=%s fast=%s/%.2f accurate=%s/%.2f "
+                "selected=%s",
+                self.uuid,
+                " ".join(transcript.text.split())[:160],
+                transcript_quality(transcript, domain_prompt),
+                " ".join(accurate.text.split())[:160],
+                transcript_quality(accurate, domain_prompt),
+                selected.model,
+            )
+            transcript = selected
         stt_done = time.monotonic()
         raw_transcript = transcript.text
         normalized_transcript = self.dialog.normalize_stt_text(raw_transcript)
@@ -235,6 +257,8 @@ class AudioSocketCall:
             safe_transcript,
         )
         answer = await self.dialog.respond(normalized_transcript)
+        if self.dialog.closed:
+            self.terminating = True
         if revision != self.turn_revision:
             latest_revision = self.turn_revision
             latest_pcm = bytes(self.turn_pcm)
@@ -285,8 +309,17 @@ class AudioSocketCall:
                 self.uuid,
             )
         if self.dialog and self.dialog.closed:
-            self.writer.write(encode_frame(0x00))
-            await self.writer.drain()
+            self.result = "assistant_hangup"
+            log.info("Kapanış anonsu tamamlandı, çağrı sonlandırılıyor uuid=%s", self.uuid)
+            with contextlib.suppress(ConnectionError):
+                self.writer.write(encode_frame(0x00))
+                await self.writer.drain()
+            # AudioSocket TCP kapanınca Asterisk uygulaması döner ve dialplan'daki
+            # Hangup çalışır. Küçük gecikme sonlandırma çerçevesinin iletilmesini sağlar.
+            await asyncio.sleep(.15)
+            self.writer.close()
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(self.writer.wait_closed(), timeout=2)
 
     async def _send_audio(self, chunk: bytes) -> None:
         self.writer.write(encode_frame(0x10, chunk))

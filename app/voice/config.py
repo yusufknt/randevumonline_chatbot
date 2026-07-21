@@ -60,7 +60,10 @@ class VoiceSettings(BaseSettings):
     # 8 kHz telefon sesinde base model özellikle tarih eklerini karıştırabiliyor.
     # Small model hâlâ yerel/ücretsizdir ve kısa ifadelerde kabul edilebilir hızdadır.
     voice_stt_fast_model: str = "small"
-    voice_stt_accurate_model: str = "small"
+    # Small model hızlı ilk geçişi yapar; düşük güvenli telefon sesi daha güçlü
+    # modelle doğrulanır. Turbo, large-v3 doğruluğunu daha düşük gecikmeyle verir.
+    voice_stt_accurate_model: str = "large-v3-turbo"
+    voice_stt_accurate_confidence_threshold: float = 0.60
     voice_stt_fast_workers: int = 2
     voice_stt_accurate_workers: int = 1
 

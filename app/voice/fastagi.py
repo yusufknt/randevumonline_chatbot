@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import uuid
 from urllib.parse import unquote
@@ -47,6 +48,7 @@ async def handle_fastagi(
             redact_phone(did),
         )
         settings = get_voice_settings()
+        channel = env.get("agi_channel", "").strip()
         command = (
             f"EXEC AudioSocket {call_uuid},"
             f"{settings.voice_audiosocket_host}:{settings.voice_audiosocket_port}\n"
@@ -59,6 +61,32 @@ async def handle_fastagi(
         if result and not result.startswith(b"200 result="):
             log.error("AudioSocket AGI başlatılamadı uuid=%s", call_uuid)
             await registry.remove(call_uuid)
+        elif result:
+            # AudioSocket sunucusu kapanış anonsundan sonra döndüğünde kanalı
+            # açık bırakma; dialplan Hangup'a ek olarak AGI seviyesinde de kapat.
+            hangup_command = f"HANGUP {channel}\n" if channel else "HANGUP\n"
+            writer.write(hangup_command.encode())
+            await writer.drain()
+            try:
+                hangup_result = await asyncio.wait_for(reader.readline(), timeout=2)
+            except asyncio.TimeoutError:
+                hangup_result = b""
+            # Kanal karşı uç veya dialplan tarafından zaten kapandıysa Asterisk
+            # FastAGI soketine doğrudan HANGUP bildirimi gönderir. Bu da başarılı
+            # sonlandırmadır, komut reddi değildir.
+            accepted = (
+                not hangup_result
+                or hangup_result.startswith(b"200 result=1")
+                or hangup_result.strip() == b"HANGUP"
+            )
+            if accepted:
+                log.info("FastAGI HANGUP kabul edildi uuid=%s", call_uuid)
+            else:
+                log.error(
+                    "FastAGI HANGUP reddedildi uuid=%s response=%s",
+                    call_uuid,
+                    hangup_result.decode("utf-8", "replace").strip()[:80],
+                )
         elif not result:
             log.info("FastAGI kanal tarafından kapatıldı uuid=%s", call_uuid)
     except (ConnectionError, asyncio.IncompleteReadError) as exc:

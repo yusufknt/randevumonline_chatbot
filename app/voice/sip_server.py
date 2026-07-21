@@ -95,7 +95,13 @@ class SIPServerProtocol(asyncio.DatagramProtocol):
             logger.info("Session destroyed")
             logger.info("Call successfully terminated")
 
-        pipeline.on_hangup = hangup_callback
+        async def call_end_callback():
+            logger.info("[CALL END] Conversation finished.")
+            logger.info("[CALL END] Calling SIP BYE...")
+            await hangup_callback()
+            logger.info("[CALL END] SIP BYE sent.")
+
+        pipeline.on_hangup = call_end_callback
         
         # RTP Sunucusu başlat
         loop = asyncio.get_running_loop()

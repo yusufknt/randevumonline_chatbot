@@ -6,7 +6,11 @@ import unittest
 
 from app.voice.audio_socket import encode_frame, read_frame
 from app.voice.identity import normalize_phone
-from app.voice.stt import _looks_like_hallucination
+from app.voice.stt import (
+    Transcript,
+    _looks_like_hallucination,
+    choose_transcript,
+)
 
 
 class VoiceFoundationTests(unittest.IsolatedAsyncioTestCase):
@@ -24,6 +28,15 @@ class VoiceFoundationTests(unittest.IsolatedAsyncioTestCase):
                 "Haftaya çarşamba günü randevu istiyorum", audio_seconds=2.0
             )
         )
+        self.assertTrue(_looks_like_hallucination("Altyazı M.K.", 1.2))
+
+    def test_context_can_keep_better_fast_transcript(self) -> None:
+        fast = Transcript("Saç kesimi", 0.26, "small", 0.1)
+        accurate = Transcript("Başka bir şey", 0.40, "large-v3-turbo", 0.1)
+        chosen = choose_transcript(
+            fast, accurate, "Beklenen hizmet adı: Saç Kesimi, Sakal Tıraşı."
+        )
+        self.assertEqual(chosen.model, "small")
 
     async def test_audiosocket_fragmented_frame(self) -> None:
         reader = asyncio.StreamReader()

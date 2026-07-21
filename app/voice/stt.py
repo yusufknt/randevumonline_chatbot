@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import numpy as np
 import soxr
 from faster_whisper import WhisperModel
+from rapidfuzz import fuzz
 
 from app.voice.config import get_voice_settings
 
@@ -28,6 +29,16 @@ def _looks_like_hallucination(text: str, audio_seconds: float) -> bool:
     words = re.findall(r"\w+", text.casefold(), flags=re.UNICODE)
     if not words:
         return False
+    normalized = " ".join(words)
+    # Whisper'ın sessizlik ve telefon müziğinde sık ürettiği altyazı kalıpları.
+    if any(
+        phrase in normalized
+        for phrase in (
+            "altyazı", "izlediğiniz için teşekkür", "abone olmayı unutmayın",
+            "çeviri m k", "sesli betimleme",
+        )
+    ):
+        return True
     if len(words) >= 8:
         unique_ratio = len(set(words)) / len(words)
         most_repeated = max(words.count(word) for word in set(words))
@@ -35,6 +46,44 @@ def _looks_like_hallucination(text: str, audio_seconds: float) -> bool:
             return True
     # Bir saniyeden kısa sesten paragraf çıkması gerçek konuşma değildir.
     return audio_seconds < 1.0 and len(text) > 80
+
+
+def _domain_terms(domain_prompt: str | None) -> list[str]:
+    if not domain_prompt:
+        return []
+    value = domain_prompt.split(":", 1)[-1]
+    return [
+        term.strip(" .")
+        for term in re.split(r",|\s+veya\s+|\s+ve\s+", value, flags=re.IGNORECASE)
+        if len(term.strip(" .")) >= 2
+    ]
+
+
+def transcript_quality(transcript: Transcript, domain_prompt: str | None) -> float:
+    """Güven, sessizlik ve beklenen sözcüklerle STT adayını puanlar."""
+    if not transcript.text:
+        return -1.0
+    score = transcript.confidence - (transcript.no_speech_probability * 0.15)
+    terms = _domain_terms(domain_prompt)
+    if terms:
+        relevance = max(
+            fuzz.partial_ratio(term.casefold(), transcript.text.casefold())
+            for term in terms
+        ) / 100.0
+        score += relevance * 0.35
+    return score
+
+
+def choose_transcript(
+    fast: Transcript, accurate: Transcript, domain_prompt: str | None
+) -> Transcript:
+    """Büyük modelin halüsinasyonunun iyi hızlı sonucu ezmesini engeller."""
+    return (
+        accurate
+        if transcript_quality(accurate, domain_prompt)
+        > transcript_quality(fast, domain_prompt)
+        else fast
+    )
 
 
 class SpeechToTextEngine:
@@ -92,7 +141,22 @@ class SpeechToTextEngine:
     @staticmethod
     def _to_16k(pcm: bytes) -> np.ndarray:
         samples = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
-        return soxr.resample(samples, 8000, 16000, quality="HQ").astype(np.float32)
+        audio = soxr.resample(samples, 8000, 16000, quality="HQ").astype(np.float32)
+        if not len(audio):
+            return audio
+
+        # Telefon hatlarında görülen DC kaymasını kaldır ve çok kısık konuşmayı
+        # sınırlı biçimde yükselt. Kazancı sınırlamak sessiz hat gürültüsünün
+        # konuşma seviyesine taşınmasını önler.
+        audio -= float(np.mean(audio))
+        rms = float(np.sqrt(np.mean(audio * audio)))
+        if rms >= 0.003:
+            gain = min(4.0, max(0.65, 0.08 / rms))
+            audio = np.clip(audio * gain, -0.98, 0.98)
+
+        # Kelime başı/sonu mel penceresine sıkışmasın.
+        padding = np.zeros(1920, dtype=np.float32)  # 120 ms @ 16 kHz
+        return np.concatenate((padding, audio, padding))
 
     @staticmethod
     def _run(
@@ -103,11 +167,20 @@ class SpeechToTextEngine:
     ) -> Transcript:
         if model is None:
             return Transcript("", 0.0, label)
+        prompt = (
+            "Türkçe bir telefon görüşmesi yazıya çevriliyor. Müşteri bir "
+            "berberden randevu, hizmet, gün veya saat isteyebilir."
+        )
+        if domain_prompt:
+            prompt = f"{prompt} {domain_prompt}"
+        turbo = "turbo" in label
         segments, _ = model.transcribe(
             audio,
             language="tr",
-            beam_size=5,
-            best_of=5,
+            # large-v3-turbo greedy decoding için eğitildi; beam=5 CPU'da
+            # konuşma başına gereksiz 6-7 saniye ekliyordu.
+            beam_size=1 if turbo else 5,
+            best_of=1 if turbo else 5,
             vad_filter=False,
             condition_on_previous_text=False,
             temperature=0,
@@ -117,10 +190,7 @@ class SpeechToTextEngine:
             log_prob_threshold=-1.0,
             no_speech_threshold=0.55,
             hotwords=domain_prompt,
-            initial_prompt=(
-                "Türkçe bir telefon görüşmesi yazıya çevriliyor. Müşteri bir "
-                "berberden randevu, hizmet, gün veya saat isteyebilir."
-            ),
+            initial_prompt=prompt,
         )
         items = list(segments)
         text = " ".join(item.text.strip() for item in items).strip()
