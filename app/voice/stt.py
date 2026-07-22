@@ -26,7 +26,8 @@ class Transcript:
 
 def _looks_like_hallucination(text: str, audio_seconds: float) -> bool:
     """Telefon gürültüsünden üretilen tekrarlı Whisper metinlerini reddeder."""
-    words = re.findall(r"\w+", text.casefold(), flags=re.UNICODE)
+    turkish_lower = text.replace("İ", "i").replace("I", "ı").casefold()
+    words = re.findall(r"\w+", turkish_lower, flags=re.UNICODE)
     if not words:
         return False
     normalized = " ".join(words)
@@ -66,11 +67,22 @@ def transcript_quality(transcript: Transcript, domain_prompt: str | None) -> flo
     score = transcript.confidence - (transcript.no_speech_probability * 0.15)
     terms = _domain_terms(domain_prompt)
     if terms:
-        relevance = max(
-            fuzz.partial_ratio(term.casefold(), transcript.text.casefold())
+        transcript_text = transcript.text.replace("İ", "i").replace("I", "ı").casefold()
+        normalized_terms = [
+            term.replace("İ", "i").replace("I", "ı").casefold()
             for term in terms
+        ]
+        relevance = max(
+            fuzz.partial_ratio(term, transcript_text)
+            for term in normalized_terms
         ) / 100.0
-        score += relevance * 0.35
+        exact = any(
+            re.search(rf"(?<!\w){re.escape(term)}(?!\w)", transcript_text)
+            for term in normalized_terms
+        )
+        score += relevance * 0.15
+        if exact:
+            score += 0.45
     return score
 
 
@@ -103,8 +115,11 @@ class SpeechToTextEngine:
 
     async def warmup(self) -> None:
         await self._ensure_models()
+        cfg = get_voice_settings()
         silence = np.zeros(1600, dtype=np.float32)
-        await asyncio.to_thread(self._run, self._fast, silence, "tiny", None)
+        await asyncio.to_thread(
+            self._run, self._fast, silence, cfg.voice_stt_fast_model, None
+        )
 
     async def _ensure_models(self) -> None:
         async with self._load_lock:
@@ -116,8 +131,8 @@ class SpeechToTextEngine:
                     cfg.voice_stt_fast_model,
                     device="cpu",
                     compute_type="int8",
-                    cpu_threads=2,
-                    num_workers=2,
+                    cpu_threads=3,
+                    num_workers=1,
                     local_files_only=True,
                 )
             if self.__class__._accurate is None:
@@ -141,6 +156,26 @@ class SpeechToTextEngine:
     @staticmethod
     def _to_16k(pcm: bytes) -> np.ndarray:
         samples = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
+        # Segmenter konuşma sonunu anlayabilmek için yaklaşık 576 ms sessizliği
+        # de ifadeye ekler. Özellikle tek kelimelik personel/saat cevaplarında bu
+        # sessizlik sesin büyük bölümünü kaplayıp Whisper sonucunu bozabiliyor.
+        # Yalnız belirgin konuşma enerjisi varsa baş/son sessizliği 120 ms payla
+        # kırp; çok kısık kayıtta güvenli biçimde ham sesi koru.
+        frame_samples = 80  # 10 ms @ 8 kHz
+        if len(samples) >= frame_samples * 10:
+            usable = len(samples) - (len(samples) % frame_samples)
+            frames = samples[:usable].reshape(-1, frame_samples)
+            frame_rms = np.sqrt(np.mean(frames * frames, axis=1))
+            reference = float(np.percentile(frame_rms, 90))
+            if reference >= 0.003:
+                active = np.flatnonzero(frame_rms >= max(0.002, reference * 0.12))
+                if active.size:
+                    margin_frames = 12
+                    start = max(0, int(active[0]) - margin_frames) * frame_samples
+                    end = min(
+                        len(frame_rms), int(active[-1]) + margin_frames + 1
+                    ) * frame_samples
+                    samples = samples[start:end]
         audio = soxr.resample(samples, 8000, 16000, quality="HQ").astype(np.float32)
         if not len(audio):
             return audio
@@ -164,22 +199,19 @@ class SpeechToTextEngine:
         audio: np.ndarray,
         label: str,
         domain_prompt: str | None,
+        contextual: bool = False,
     ) -> Transcript:
         if model is None:
             return Transcript("", 0.0, label)
-        prompt = (
-            "Türkçe bir telefon görüşmesi yazıya çevriliyor. Müşteri bir "
-            "berberden randevu, hizmet, gün veya saat isteyebilir."
-        )
-        if domain_prompt:
-            prompt = f"{prompt} {domain_prompt}"
+        hotwords = domain_prompt.split(":", 1)[-1].strip() if domain_prompt else None
         turbo = "turbo" in label
+        beam_size = 1 if turbo else (3 if contextual else 5)
         segments, _ = model.transcribe(
             audio,
             language="tr",
             # large-v3-turbo greedy decoding için eğitildi; beam=5 CPU'da
             # konuşma başına gereksiz 6-7 saniye ekliyordu.
-            beam_size=1 if turbo else 5,
+            beam_size=beam_size,
             best_of=1 if turbo else 5,
             vad_filter=False,
             condition_on_previous_text=False,
@@ -189,8 +221,14 @@ class SpeechToTextEngine:
             compression_ratio_threshold=2.2,
             log_prob_threshold=-1.0,
             no_speech_threshold=0.55,
-            hotwords=domain_prompt,
-            initial_prompt=prompt,
+            # Beklenen adları yalnız hotword olarak ver. Bunları initial_prompt'a
+            # yazmak kısa telefon sesinde modelin müşteriyi değil prompt metnini
+            # tekrar etmesine yol açıyordu.
+            hotwords=hotwords,
+            # İlk hızlı geçiş serbest konuşmayı olduğu gibi çözer. Düşük güvenli
+            # ikinci geçiş yalnız beklenen ad/hizmet/tarih/saat kelimeleriyle
+            # yönlendirilir; aynı model ve aynı gerçek ses kullanılır.
+            initial_prompt=None,
         )
         items = list(segments)
         text = " ".join(item.text.strip() for item in items).strip()
@@ -222,6 +260,7 @@ class SpeechToTextEngine:
         pcm: bytes,
         accurate: bool = False,
         domain_prompt: str | None = None,
+        contextual: bool = False,
     ) -> Transcript:
         if len(pcm) < 3200:
             return Transcript("", 0.0, "none")
@@ -238,4 +277,5 @@ class SpeechToTextEngine:
                 audio,
                 cfg.voice_stt_accurate_model if accurate else cfg.voice_stt_fast_model,
                 domain_prompt,
+                contextual,
             )

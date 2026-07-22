@@ -29,6 +29,9 @@ class VoiceFoundationTests(unittest.IsolatedAsyncioTestCase):
             )
         )
         self.assertTrue(_looks_like_hallucination("Altyazı M.K.", 1.2))
+        self.assertTrue(
+            _looks_like_hallucination("İzlediğiniz için teşekkür ederim.", 1.5)
+        )
 
     def test_context_can_keep_better_fast_transcript(self) -> None:
         fast = Transcript("Saç kesimi", 0.26, "small", 0.1)

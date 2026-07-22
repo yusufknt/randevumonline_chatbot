@@ -8,7 +8,7 @@ Bu betik:
 
 import asyncio
 import logging
-from app.voice.sip_server import SIPServerProtocol
+from app.voice.sip_server import start_sip_server
 from app.voice.config import get_voice_settings
 
 # Log yapılandırması
@@ -23,14 +23,8 @@ async def main() -> None:
     host = settings.voice_server_host
     port = settings.voice_server_port
 
-    loop = asyncio.get_running_loop()
-    
     logger.info("SIP UDP Sunucusu başlatılıyor (%s:%s)...", host, port)
-    
-    transport, protocol = await loop.create_datagram_endpoint(
-        lambda: SIPServerProtocol(),
-        local_addr=(host, port)
-    )
+    transport, protocol = await start_sip_server()
 
     try:
         # 7/24 çalışmasını sağla
@@ -38,7 +32,7 @@ async def main() -> None:
     except asyncio.CancelledError:
         logger.info("SIP Sunucusu kapatılıyor...")
     finally:
-        transport.close()
+        await protocol.close()
         logger.info("Sunucu başarıyla kapatıldı.")
 
 if __name__ == "__main__":

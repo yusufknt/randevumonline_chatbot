@@ -7,6 +7,8 @@ import logging
 import struct
 import time
 import uuid
+import wave
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -58,6 +60,10 @@ async def resolve_business(did: str) -> dict | None:
 
 
 class AudioSocketCall:
+    LOCKED_INTRO = "locked_intro"
+    INTERRUPTIBLE_DIALOG = "interruptible_dialog"
+    TERMINATING = "terminating"
+
     def __init__(
         self, call_uuid: str, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
@@ -70,6 +76,7 @@ class AudioSocketCall:
         self.playback: asyncio.Task | None = None
         self.current_turn: asyncio.Task | None = None
         self.turn_pcm = bytearray()
+        self.pending_utterances: deque[bytes] = deque()
         self.turn_revision = 0
         self.started = time.monotonic()
         self.first_audio_at: float | None = None
@@ -78,6 +85,7 @@ class AudioSocketCall:
         self.result = "completed"
         self.business_id = None
         self.terminating = False
+        self.phase = self.LOCKED_INTRO
 
     async def run(self) -> None:
         context = await registry.wait(self.uuid)
@@ -90,7 +98,11 @@ class AudioSocketCall:
         self.dialog = DialogManager(business, context.caller, self.uuid)
         await self.dialog.initialize()
         ACTIVE_CALLS.inc()
-        self.playback = asyncio.create_task(self._play_greeting())
+        # Karşılama sabit bir anons olduğu için normal TTS barge-in akışından
+        # ayrılır. Bayrağı task başlamadan etkinleştirerek ilk ses paketindeki yarışı
+        # da önlüyoruz.
+        self.phase = self.LOCKED_INTRO
+        self._start_playback(self._play_opening())
         try:
             while True:
                 packet_type, payload = await read_frame(self.reader)
@@ -104,13 +116,26 @@ class AudioSocketCall:
                 self.frames_in += 1
                 # Başarılı işlemden sonra kapanış anonsu kesilmesin ve yeni bir
                 # STT/LLM turu başlamasın.
-                if self.terminating or (self.dialog and self.dialog.closed):
+                if self.phase == self.TERMINATING or self.terminating or (
+                    self.dialog and self.dialog.closed
+                ):
+                    continue
+                # İlk karşılama kesilemez. Bu sırada gelen çağrı sesi daha sonra
+                # yanlışlıkla bir seçimmiş gibi işlenmesin diye VAD'a verilmez.
+                if self.phase == self.LOCKED_INTRO:
                     continue
                 barge, utterances = self.segmenter.feed(
                     payload, bool(self.playback and not self.playback.done())
                 )
                 if barge:
                     BARGE_INS.inc()
+                    log.info(
+                        "Araya giriş doğrulandı uuid=%s vad=%.2f rms=%.0f noise=%.0f",
+                        self.uuid,
+                        self.segmenter.last_probability,
+                        self.segmenter.last_rms,
+                        self.segmenter.noise_floor,
+                    )
                     await self._cancel_playback()
                 if utterances:
                     for utterance in utterances:
@@ -126,83 +151,259 @@ class AudioSocketCall:
             with contextlib.suppress(asyncio.CancelledError):
                 await self.playback
 
-    def _turn_finished(self, task: asyncio.Task) -> None:
+    def _start_playback(self, awaitable) -> None:
+        task = asyncio.create_task(awaitable)
+        task.add_done_callback(self._playback_finished)
+        self.playback = task
+
+    def _playback_finished(self, task: asyncio.Task) -> None:
         if task.cancelled():
             return
         error = task.exception()
-        if error:
+        if error is not None:
+            log.error(
+                "Ses oynatma görevi başarısız uuid=%s type=%s",
+                self.uuid,
+                type(error).__name__,
+                exc_info=(type(error), error, error.__traceback__),
+            )
+
+    def _turn_finished(self, task: asyncio.Task) -> None:
+        if self.current_turn is not task:
+            return
+        self.current_turn = None
+        error = None if task.cancelled() else task.exception()
+        if error is not None:
             log.error(
                 "Konuşma turu başarısız uuid=%s type=%s",
                 self.uuid,
                 type(error).__name__,
             )
+        if self.pending_utterances and self.phase != self.TERMINATING:
+            self._start_next_turn()
 
-    def _start_turn(self, pcm: bytes, revision: int) -> None:
-        self.current_turn = asyncio.create_task(
-            self._process_turn(pcm, revision)
-        )
+    def _start_turn(self, pcm: bytes) -> None:
+        self.turn_pcm = bytearray(pcm)
+        self.turn_revision += 1
+        self.current_turn = asyncio.create_task(self._process_turn(pcm))
         self.current_turn.add_done_callback(self._turn_finished)
 
-    def _queue_utterance(self, utterance: bytes) -> None:
-        """STT sürerken gelen devam cümlesini kaybetmeden aynı tura ekler."""
-        active = bool(self.current_turn and not self.current_turn.done())
-        if active and self.turn_pcm:
-            # Ayrı VAD parçaları Whisper tarafından tek kelime gibi
-            # birleştirilmesin; araya 100 ms telefon sessizliği koy.
-            self.turn_pcm.extend(b"\0" * 1600)
-            self.turn_pcm.extend(utterance)
-        else:
-            self.turn_pcm = bytearray(utterance)
-        self.turn_revision += 1
-        revision = self.turn_revision
+    def _start_next_turn(self) -> None:
+        if not self.pending_utterances:
+            return
+        pcm = self.pending_utterances.popleft()
         log.info(
-            "%s uuid=%s audio_ms=%d vad=%.2f rms=%.0f",
-            "Konuşma devamı birleştirildi" if active else "Konuşma algılandı",
+            "Sıradaki kullanıcı konuşması işleniyor uuid=%s audio_ms=%d queue=%d",
             self.uuid,
-            len(self.turn_pcm) // 16,
+            len(pcm) // 16,
+            len(self.pending_utterances),
+        )
+        self._start_turn(pcm)
+
+    def _queue_utterance(self, utterance: bytes) -> None:
+        """STT sürerken gelen ifadeyi mevcut sesi bozmayacak ayrı turda tutar."""
+        active = bool(self.current_turn and not self.current_turn.done())
+        if active or self.pending_utterances:
+            # Her tamamlanan ifade kendi sırasını korur. Böylece kullanıcı
+            # "Yusuf", "saç kesimi", "yarın", "beş" diye hızlı ve parçalı
+            # konuştuğunda ara parçalar ezilmez veya tek uzun sese eklenmez.
+            limit = max(1, get_voice_settings().voice_max_pending_utterances)
+            if len(self.pending_utterances) >= limit:
+                dropped = self.pending_utterances.popleft()
+                log.info(
+                    "Eski konuşma parçası kuyruk sınırında düşürüldü uuid=%s "
+                    "audio_ms=%d limit=%d",
+                    self.uuid,
+                    len(dropped) // 16,
+                    limit,
+                )
+            self.pending_utterances.append(bytes(utterance))
+            log.info(
+                "Kullanıcı konuşması FIFO sırasına alındı uuid=%s "
+                "audio_ms=%d queue=%d",
+                self.uuid,
+                len(utterance) // 16,
+                len(self.pending_utterances),
+            )
+            return
+        log.info(
+            "Konuşma algılandı uuid=%s audio_ms=%d vad=%.2f rms=%.0f",
+            self.uuid,
+            len(utterance) // 16,
             self.segmenter.last_probability,
             self.segmenter.last_rms,
         )
-        if not active:
-            self._start_turn(bytes(self.turn_pcm), revision)
+        self._start_turn(bytes(utterance))
 
     async def _play_greeting(self) -> None:
         path = Path(get_voice_settings().voice_greeting_pcm)
-        if not path.is_file():
-            return
-        data = path.read_bytes()
-        for offset in range(0, len(data), 320):
-            chunk = data[offset:offset + 320].ljust(320, b"\0")
-            await self._send_audio(chunk)
-            await asyncio.sleep(.02)
+        try:
+            if not path.is_file():
+                log.error("Hazır karşılama dosyası bulunamadı path=%s", path)
+                return
+            data = self._read_greeting_pcm(path)
+            log.info(
+                "Hazır karşılama başladı uuid=%s file=%s audio_ms=%d",
+                self.uuid,
+                path.name,
+                len(data) // 16,
+            )
+            for offset in range(0, len(data), 320):
+                chunk = data[offset:offset + 320].ljust(320, b"\0")
+                await self._send_audio(chunk)
+                await asyncio.sleep(.02)
+            log.info("Hazır karşılama tamamlandı uuid=%s", self.uuid)
+        finally:
+            if self.phase != self.TERMINATING:
+                self.phase = self.INTERRUPTIBLE_DIALOG
 
-    async def _process_turn(self, pcm: bytes, revision: int) -> None:
+    async def _play_opening(self) -> None:
+        """Kesilemez hazır karşılamayı, ardından kesilebilir ilk soruyu oynatır."""
+        if not self.dialog:
+            await self._play_greeting()
+            return
+        prompt = self.dialog.opening_prompt()
+        opening_path_value = getattr(
+            get_voice_settings(), "voice_opening_pcm", ""
+        )
+        opening_path = Path(opening_path_value) if opening_path_value else None
+
+        if opening_path and opening_path.is_file():
+            await self._play_greeting()
+            if self.dialog.closed or self.terminating:
+                return
+            data = self._read_greeting_pcm(opening_path)
+            chunks_sent = 0
+            try:
+                for offset in range(0, len(data), 320):
+                    await self._send_audio(
+                        data[offset:offset + 320].ljust(320, b"\0")
+                    )
+                    chunks_sent += 1
+                    await asyncio.sleep(.02)
+                log.info(
+                    "Hazır kesilebilir personel sorusu tamamlandı uuid=%s chunks=%d",
+                    self.uuid,
+                    chunks_sent,
+                )
+            except asyncio.CancelledError:
+                log.info(
+                    "Hazır personel sorusu kullanıcı konuşmasıyla kesildi "
+                    "uuid=%s chunks=%d",
+                    self.uuid,
+                    chunks_sent,
+                )
+                raise
+            return
+
+        async def prepare() -> list[bytes]:
+            tts = TextToSpeechEngine()
+            return [chunk async for chunk in tts.synthesize_stream(prompt)]
+
+        # TTS üretimini 4 saniyelik hazır WAV çalarken başlat. WAV kesilemez;
+        # fakat hazırlanan personel sorusu WAV biter bitmez normal biçimde
+        # oynar ve kullanıcı konuşunca iptal edilebilir.
+        prepared = asyncio.create_task(prepare())
+        chunks_sent = 0
+        try:
+            await self._play_greeting()
+            if self.dialog.closed or self.terminating:
+                return
+            chunks = await prepared
+            if not chunks:
+                log.error("Açılış personel TTS sesi üretilemedi uuid=%s", self.uuid)
+                return
+            for chunk in chunks:
+                await self._send_audio(chunk)
+                chunks_sent += 1
+                await asyncio.sleep(.02)
+            log.info(
+                "Açılış personel TTS tamamlandı uuid=%s chunks=%d",
+                self.uuid,
+                chunks_sent,
+            )
+        except asyncio.CancelledError:
+            log.info(
+                "Açılış personel TTS kullanıcı konuşmasıyla kesildi uuid=%s chunks=%d",
+                self.uuid,
+                chunks_sent,
+            )
+            raise
+        finally:
+            if not prepared.done():
+                prepared.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await prepared
+
+    @staticmethod
+    def _read_greeting_pcm(path: Path) -> bytes:
+        """8 kHz mono 16-bit WAV veya eski ham SLIN dosyasını okur."""
+        if path.suffix.lower() != ".wav":
+            return path.read_bytes()
+        with wave.open(str(path), "rb") as audio:
+            audio_format = (
+                audio.getnchannels(),
+                audio.getsampwidth(),
+                audio.getframerate(),
+                audio.getcomptype(),
+            )
+            if audio_format != (1, 2, 8000, "NONE"):
+                raise ValueError(
+                    "Karşılama WAV dosyası 8 kHz mono 16-bit PCM olmalı"
+                )
+            return audio.readframes(audio.getnframes())
+
+    async def _process_turn(self, pcm: bytes) -> None:
         started = time.monotonic()
         assert self.dialog is not None
         expected_state, domain_prompt = self.dialog.stt_context()
         with STT_SECONDS.time():
             transcript = await self.stt.transcribe(pcm, domain_prompt=domain_prompt)
-        if revision != self.turn_revision:
-            # STT çalışırken kullanıcı cümleye devam etti. Eksik ilk parçaya
-            # cevap vermek yerine bütün parçaları birlikte çözümleriz.
-            latest_revision = self.turn_revision
-            latest_pcm = bytes(self.turn_pcm)
-            log.info(
-                "Birleştirilmiş konuşma yeniden çözümleniyor uuid=%s "
-                "audio_ms=%d revision=%d",
-                self.uuid,
-                len(latest_pcm) // 16,
-                latest_revision,
+        cfg = get_voice_settings()
+        if (
+            transcript.confidence < cfg.voice_stt_context_retry_confidence
+            and expected_state != "general"
+            and cfg.voice_stt_accurate_model != cfg.voice_stt_fast_model
+        ):
+            contextual = await self.stt.transcribe(
+                pcm,
+                domain_prompt=domain_prompt,
+                contextual=True,
             )
-            self._start_turn(latest_pcm, latest_revision)
-            return
+            selected = choose_transcript(transcript, contextual, domain_prompt)
+            log.info(
+                "STT bağlamsal ikinci geçiş uuid=%s state=%s "
+                "first=%s/%.2f contextual=%s/%.2f selected=%s",
+                self.uuid,
+                expected_state,
+                " ".join(transcript.text.split())[:120],
+                transcript_quality(transcript, domain_prompt),
+                " ".join(contextual.text.split())[:120],
+                transcript_quality(contextual, domain_prompt),
+                "contextual" if selected is contextual else "first",
+            )
+            transcript = selected
         if not transcript.text:
             self.turn_pcm.clear()
-            log.info("STT boş sonuç uuid=%s", self.uuid)
+            answer = self.dialog.low_confidence_retry_prompt()
+            log.info(
+                "STT boş sonuç; durum korunarak tekrar soruluyor uuid=%s state=%s",
+                self.uuid,
+                expected_state,
+            )
+            if self.pending_utterances:
+                log.info(
+                    "Boş STT tekrar sorusu kuyruk bitene kadar ertelendi "
+                    "uuid=%s queue=%d",
+                    self.uuid,
+                    len(self.pending_utterances),
+                )
+                return
+            await self._cancel_playback()
+            self._start_playback(self._speak(answer, started))
             return
         # Aynı modeli aynı ayarlarla ikinci kez çalıştırmak yalnızca gecikmeyi
         # artırır. Doğrulama modeli gerçekten farklıysa düşük güveni doğrula.
-        cfg = get_voice_settings()
         if (
             transcript.confidence < cfg.voice_stt_accurate_confidence_threshold
             and len(pcm) >= 12800
@@ -233,6 +434,83 @@ class AudioSocketCall:
         stt_done = time.monotonic()
         raw_transcript = transcript.text
         normalized_transcript = self.dialog.normalize_stt_text(raw_transcript)
+        if self.dialog.is_probable_playback_echo(normalized_transcript):
+            self.turn_pcm.clear()
+            log.info(
+                "Okunan liste yankısı reddedildi uuid=%s state=%s text=%s",
+                self.uuid,
+                expected_state,
+                " ".join(normalized_transcript.split())[:160],
+            )
+            return
+        expected_entity_recognized = self.dialog.accepts_low_confidence_transcript(
+            normalized_transcript
+        )
+        if (
+            transcript.confidence < cfg.voice_stt_absolute_min_confidence
+            and not expected_entity_recognized
+        ):
+            self.turn_pcm.clear()
+            answer = self.dialog.low_confidence_retry_prompt()
+            log.info(
+                "Mutlak düşük güvenli STT reddedildi uuid=%s state=%s "
+                "confidence=%.2f text=%s",
+                self.uuid,
+                expected_state,
+                transcript.confidence,
+                " ".join(normalized_transcript.split())[:160],
+            )
+            if self.pending_utterances:
+                log.info(
+                    "Tekrar sorusu kuyruk bitene kadar ertelendi uuid=%s queue=%d",
+                    self.uuid,
+                    len(self.pending_utterances),
+                )
+                return
+            await self._cancel_playback()
+            self._start_playback(self._speak(answer, started))
+            return
+        if (
+            transcript.confidence < cfg.voice_stt_min_actionable_confidence
+            and not expected_entity_recognized
+        ):
+            self.turn_pcm.clear()
+            answer = self.dialog.low_confidence_retry_prompt()
+            log.info(
+                "Düşük güvenli STT reddedildi uuid=%s state=%s confidence=%.2f "
+                "text=%s",
+                self.uuid,
+                expected_state,
+                transcript.confidence,
+                " ".join(normalized_transcript.split())[:160],
+            )
+            await self._cancel_playback()
+            if self.pending_utterances:
+                log.info(
+                    "Düşük güven tekrar sorusu kuyruk bitene kadar ertelendi "
+                    "uuid=%s queue=%d",
+                    self.uuid,
+                    len(self.pending_utterances),
+                )
+                return
+            self._start_playback(self._speak(answer, started))
+            return
+        if (
+            transcript.confidence < cfg.voice_stt_min_actionable_confidence
+            and expected_entity_recognized
+        ):
+            sanitized = self.dialog.sanitize_low_confidence_transcript(
+                normalized_transcript
+            )
+            log.info(
+                "Düşük güvenli STT yalnız kesin alanla sınırlandı uuid=%s "
+                "state=%s raw=%s sanitized=%s",
+                self.uuid,
+                expected_state,
+                " ".join(normalized_transcript.split())[:160],
+                sanitized,
+            )
+            normalized_transcript = sanitized
         log.info(
             "STT tamam uuid=%s state=%s model=%s confidence=%.2f chars=%d ms=%d",
             self.uuid,
@@ -259,11 +537,8 @@ class AudioSocketCall:
         answer = await self.dialog.respond(normalized_transcript)
         if self.dialog.closed:
             self.terminating = True
-        if revision != self.turn_revision:
-            latest_revision = self.turn_revision
-            latest_pcm = bytes(self.turn_pcm)
-            self._start_turn(latest_pcm, latest_revision)
-            return
+            self.phase = self.TERMINATING
+            self.pending_utterances.clear()
         self.turn_pcm.clear()
         safe_answer = " ".join(answer.split())[:500]
         log.info(
@@ -278,11 +553,23 @@ class AudioSocketCall:
             round((time.monotonic() - stt_done) * 1000),
         )
         await self._cancel_playback()
-        self.playback = asyncio.create_task(self._speak(answer, started))
+        if self.pending_utterances and not self.dialog.closed:
+            log.info(
+                "Ara asistan cevabı kuyruk bitene kadar seslendirilmedi "
+                "uuid=%s queue=%d",
+                self.uuid,
+                len(self.pending_utterances),
+            )
+            return
+        if getattr(self.dialog, "completion_kind", None) == "booking_success":
+            self._start_playback(self._play_booking_success())
+        else:
+            self._start_playback(self._speak(answer, started))
 
     async def _speak(self, text: str, turn_started: float) -> None:
         tts = TextToSpeechEngine()
         first = True
+        chunks_sent = 0
         try:
             async for chunk in tts.synthesize_stream(text):
                 if first:
@@ -294,8 +581,14 @@ class AudioSocketCall:
                     )
                     first = False
                 await self._send_audio(chunk)
+                chunks_sent += 1
                 await asyncio.sleep(.02)
         except asyncio.CancelledError:
+            log.info(
+                "TTS stream kullanıcı konuşmasıyla kesildi uuid=%s chunks=%d",
+                self.uuid,
+                chunks_sent,
+            )
             raise
         except Exception as exc:
             log.error(
@@ -308,18 +601,56 @@ class AudioSocketCall:
                 "TTS cevabı üretilemedi uuid=%s; farklı konuşmacı sesi oynatılmadı",
                 self.uuid,
             )
+        else:
+            log.info(
+                "TTS stream tamamlandı uuid=%s chunks=%d audio_ms=%d",
+                self.uuid,
+                chunks_sent,
+                chunks_sent * 20,
+            )
         if self.dialog and self.dialog.closed:
-            self.result = "assistant_hangup"
-            log.info("Kapanış anonsu tamamlandı, çağrı sonlandırılıyor uuid=%s", self.uuid)
-            with contextlib.suppress(ConnectionError):
-                self.writer.write(encode_frame(0x00))
-                await self.writer.drain()
-            # AudioSocket TCP kapanınca Asterisk uygulaması döner ve dialplan'daki
-            # Hangup çalışır. Küçük gecikme sonlandırma çerçevesinin iletilmesini sağlar.
-            await asyncio.sleep(.15)
-            self.writer.close()
-            with contextlib.suppress(Exception):
-                await asyncio.wait_for(self.writer.wait_closed(), timeout=2)
+            await self._finish_assistant_hangup()
+
+    async def _play_booking_success(self) -> None:
+        """Başarılı kayıt kapanışını hazır sesten eksiksiz oynatıp hattı kapatır."""
+        path = Path(get_voice_settings().voice_booking_success_pcm)
+        if not path.is_file():
+            log.error(
+                "Hazır başarılı randevu kapanışı bulunamadı uuid=%s path=%s",
+                self.uuid,
+                path,
+            )
+            # Ön kontrol bu durumu canlıdan önce engeller. Yine de çağrıyı sessiz
+            # kapatmamak için aynı metni mevcut ana TTS sağlayıcısıyla dene.
+            await self._speak("Randevunuz oluşturuldu. İyi günler.", time.monotonic())
+            return
+        data = self._read_greeting_pcm(path)
+        chunks_sent = 0
+        for offset in range(0, len(data), 320):
+            chunk = data[offset:offset + 320].ljust(320, b"\0")
+            await self._send_audio(chunk)
+            chunks_sent += 1
+            await asyncio.sleep(.02)
+        log.info(
+            "Başarılı randevu kapanış WAV tamamlandı uuid=%s chunks=%d audio_ms=%d",
+            self.uuid,
+            chunks_sent,
+            chunks_sent * 20,
+        )
+        await self._finish_assistant_hangup()
+
+    async def _finish_assistant_hangup(self) -> None:
+        self.result = "assistant_hangup"
+        log.info("Kapanış anonsu tamamlandı, çağrı sonlandırılıyor uuid=%s", self.uuid)
+        with contextlib.suppress(ConnectionError):
+            self.writer.write(encode_frame(0x00))
+            await self.writer.drain()
+        # AudioSocket TCP kapanınca Asterisk uygulaması döner ve dialplan'daki
+        # Hangup çalışır. Küçük gecikme sonlandırma çerçevesinin iletilmesini sağlar.
+        await asyncio.sleep(.15)
+        self.writer.close()
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(self.writer.wait_closed(), timeout=2)
 
     async def _send_audio(self, chunk: bytes) -> None:
         self.writer.write(encode_frame(0x10, chunk))
@@ -329,12 +660,18 @@ class AudioSocketCall:
             self.first_audio_at = time.monotonic()
 
     async def close(self) -> None:
+        # İptal edilen STT görevinin callback'i bekleyen FIFO turunu yeniden
+        # başlatmasın; çağrı kapanırken artık hiçbir yeni iş kabul edilmez.
+        self.phase = self.TERMINATING
         await self._cancel_playback()
         if self.current_turn and not self.current_turn.done():
             self.current_turn.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self.current_turn
+        self.pending_utterances.clear()
         await registry.remove(self.uuid)
+        if self.dialog:
+            await self.dialog.shutdown()
         self.writer.close()
         with contextlib.suppress(Exception):
             await self.writer.wait_closed()

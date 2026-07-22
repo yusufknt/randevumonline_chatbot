@@ -13,7 +13,10 @@ MongoDB'de randevu oluşturan, çok-kiracılı (multi-tenant) Python servisi.
 git clone <repo-url> randevumonline-chatbot && cd randevumonline-chatbot
 ```
 
-**Önkoşullar:** Python 3.12+, MongoDB 8, ngrok. (Opsiyonel: Groq API key — IG AI müşteri temsilcisi.)
+**Önkoşullar:** Python 3.12+, MongoDB 8, Redis 8, ngrok. Redis sesli
+rezervasyonda hibrit oturum cache'i için yalnız localhost üzerinde çalışır;
+kesinti halinde ses servisi process belleği ve MongoDB ile devam eder.
+(Opsiyonel: Groq API key — IG AI müşteri temsilcisi.)
 
 Kurulum komutları tek bir kanonik yerde — burada tekrarlanmaz:
 
@@ -38,12 +41,14 @@ Kurulum komutları tek bir kanonik yerde — burada tekrarlanmaz:
 │   │   ├── availability.py       slot hesabı (saatler, izinler, çakışma, oda)
 │   │   └── format.py             kanal/araç çıktısı için ortak metin biçimlendirme (saf fonksiyonlar)
 │   ├── voice/                    Sesli Randevu Asistanı (Voice Agent)
-│   │   ├── audio_socket.py       Asterisk TCP AudioSocket asenkron sunucusu (8010 portu)
+│   │   ├── sip_server.py         Netgsm doğrudan SIP çağrı yönetimi ve BYE
+│   │   ├── rtp_server.py         PCMA/RTP giriş-çıkış taşıyıcısı
+│   │   ├── audio_socket.py       Taşıyıcıdan bağımsız diyalog, VAD ve ses akışı çekirdeği
 │   │   ├── stt.py                faster-whisper ile konuşmayı metne dökme (STT) + VAD
 │   │   ├── llm.py                Groq / Ollama kısa-öz Türkçe sesli asistan beyni
 │   │   ├── tools.py              MongoDB randevu kontrolü & booking entegrasyonu
 │   │   ├── tts.py                Piper TTS ile metni 8kHz PCM sese dönüştürme
-│   │   └── pipeline.py           STT -> LLM -> TTS akış ve söz kesme (barge-in) yöneticisi
+│   │   └── dialog.py             Randevu durumu ve iş kuralları
 │   └── channels/
 │       ├── whatsapp/
 │       │   ├── client.py         parse, signature, send_text
@@ -112,7 +117,7 @@ WhatsApp Cloud API                 Instagram Graph API
         │                                  │
          └─► booking.create_appointment ─► MongoDB ◄── booking_url (web sitesi)
 
-### Sesli Asistan (NetGSM SIP -> Asterisk -> AudioSocket) Mimarisi
+### Sesli Asistan (Netgsm -> doğrudan Python SIP/RTP) Mimarisi
 
 ```
 Telefon Çağrısı
@@ -121,33 +126,34 @@ Telefon Çağrısı
    Netgsm SIP Trunk
         │ (UDP/RTP)
         ▼
- Asterisk / PBX Sunucusu (Gelen Çağrıyı Karşılar)
+ Python SIP sunucusu (UDP 8010)
         │
-        ▼ (TCP AudioSocket Port 8010)
-  FastAPI app/main.py -> AudioSocketServer
+        ├── RTP PCMA/8000 (UDP 10000-10100)
+        ▼
+  DialogManager + VAD/FIFO/barge-in
         │
         ▼
   STT -> LLM -> TTS (Pipeline)
 ```
 
 **Voice Bot (Sesli Asistan) Özellikleri:**
-- **Zero-Delay Startup (Sıfır Gecikmeli Karşılama)**: Çağrı açıldığı an, herhangi bir LLM veya TTS işlemini beklemeden `app/voice/assets/greeting.alaw` üzerinden hazır karşılama anonsu çalınır. Bu sayede bekleme süreleri tamamen ortadan kalkar. Dosya bulunamazsa otomatik olarak eski modele (Dinamik TTS) döner.
+- **Hazır karşılama:** Kesilemez giriş ve kesilebilir usta listesi 8 kHz PCM WAV dosyalarından oynatılır.
 - **Full-Duplex (Doğal Konuşma / Barge-in) Modu**: ChatGPT Voice benzeri, asistan konuşurken kullanıcı araya girdiğinde anında susma ve yeni söylenenleri dikkate alarak bağlamı yeniden kurma yeteneği (Faz 3).
 - **Akıllı Çağrı Sonlandırma (Graceful Termination)**: Görüşme bittiğinde asistanın 1 saniye bekleyip SIP üzerinden `BYE` göndererek ve `200 OK` onayı bekleyerek çağrıyı pürüzsüz bir şekilde sonlandırması (Faz 4).
 
 **NetGSM Test Adımları:**
-1. Sunucu üzerinde projeyi güncelleyin ve başlatın: 
+1. Sunucu üzerinde projeyi güncelleyin ve PM2 sürecini başlatın:
    ```bash
-   git pull && .venv/bin/python3 -m scripts.run_voice_server
+   pm2 startOrReload ecosystem.large-test.config.cjs --update-env
    ```
-2. Asterisk veya kullandığınız SIP sunucunuzun Netgsm trunk ayarlarını yapın.
-3. Asterisk `extensions.conf` üzerinden gelen çağrıları `AudioSocket` ile `tcp://<SUNUCU-IP>:8010` adresine yönlendirin.
-4. Netgsm numaranızı aradığınızda çağrı Asterisk üzerinden Python uygulamasına ulaşacak, terminal loglarında `"📞 [Yeni Çağrı] AudioSocket bağlantısı alındı"` kaydını göreceksiniz.
+2. Netgsm trunk hedefini WireGuard adresindeki UDP 8010 portuna yönlendirin.
+3. `VOICE_SIP_ALLOWED_HOSTS` değerinde yalnız Netgsm SIP eşlerini tutun.
+4. Numara arandığında loglarda `Netgsm çağrısı doğrudan kabul edildi` kaydı görülür.
 5. Bot ile konuşarak sesli test yapabilirsiniz. Lokal mikrofon testi olan `test_voice_live_mic.py` artık sadece geliştirme sırasında opsiyonel olarak kullanılmaktadır.
 
 **Sorun Giderme (Troubleshooting):**
 - **Health Check:** Botun genel sağlık durumunu `curl http://localhost:8000/health` adresiyle kontrol edebilirsiniz. SIP portunun dinlenip dinlenmediği, LLM, STT ve TTS bağlantı durumları bu JSON çıktısında görülür.
-- **Çağrı Düşmesi / Ses Gelmemesi:** Netgsm -> Asterisk arasındaki UDP/RTP portlarının Firewall (iptables/ufw) üzerinde açık olduğundan emin olun. Ayrıca Asterisk -> Python arasındaki TCP 8010 portunun erişilebilir olduğunu kontrol edin.
+- **Çağrı Düşmesi / Ses Gelmemesi:** Netgsm WireGuard eşinden UDP 8010 ve UDP 10000-10100 erişimini kontrol edin. Asterisk bu mimaride çalışmamalıdır.
 - **Geç Yanıt Verme (Timeout):** LLM (Groq/DeepSeek) API'lerinde anlık yavaşlık olursa sistem otomatik olarak "Sistemde geçici bir yoğunluk var" anonsu okur ve kapanmaz. Kalıcı yavaşlıkta API limitlerini veya ağ bağlantınızı kontrol edin.
 ```
 

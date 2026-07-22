@@ -10,7 +10,7 @@ class CallContext:
     uuid: str
     caller: str
     did: str
-    asterisk_uniqueid: str
+    provider_call_id: str
     created_monotonic: float = field(default_factory=time.monotonic)
 
 

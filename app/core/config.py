@@ -44,6 +44,18 @@ class Settings(BaseSettings):
     ai_max_tool_iterations: int = 5
     conversation_history_turns: int = 8
 
+    # Rezervasyon ekranları ve telefon diyaloğu için process-içi oturum cache'i.
+    # Kısa TTL, uygunluk bilgisinin hız ile güncellik dengesini korur.
+    booking_session_cache_ttl_s: float = 120.0
+    booking_session_cache_max_sessions: int = 2000
+    booking_session_cache_max_entries: int = 256
+
+    # Sesli rezervasyon: process belleği + yerel Redis hibrit cache.
+    redis_url: str = "redis://127.0.0.1:6379/0"
+    voice_cache_session_ttl_s: float = 600.0
+    voice_cache_catalog_ttl_s: float = 60.0
+    voice_cache_redis_timeout_s: float = 0.1
+
     log_level: str = "INFO"
 
 

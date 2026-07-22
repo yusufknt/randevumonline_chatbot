@@ -1,207 +1,203 @@
-"""
-RTP ve SIP Sunucu Uygulaması (Asterisk olmadan) - Asenkron Pipeline Modeli
-"""
+"""Netgsm ile doğrudan PCMA/RTP medya taşıyıcısı."""
+
+from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import struct
 import time
-from typing import Callable, Coroutine, Any
-from app.voice.pipeline import VoicePipeline
-from app.voice.models import VoiceSession, SessionState
+from collections import deque
+from collections.abc import Callable
+
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
-# G.711 A-Law ve U-Law için lookup tabloları ve decode/encode fonksiyonları
+
+# ITU-T G.711 A-law dönüşüm tablosu. Telefon tarafından gelen PCMA, mevcut
+# DialogManager hattının beklediği 8 kHz mono signed-linear PCM'e çevrilir.
 ALAW_DECODE_TABLE = [0] * 256
-for i in range(256):
-    alaw = i ^ 0x55
-    sign = (alaw & 0x80)
-    exponent = (alaw & 0x70) >> 4
-    mantissa = alaw & 0x0f
-    
-    sample = (mantissa << 4) + 8
-    if exponent != 0:
-        sample += 0x100
-        sample <<= (exponent - 1)
-        
-    if sign == 0:
-        ALAW_DECODE_TABLE[i] = sample
-    else:
-        ALAW_DECODE_TABLE[i] = -sample
+for _index in range(256):
+    _alaw = _index ^ 0x55
+    _exponent = (_alaw & 0x70) >> 4
+    _sample = ((_alaw & 0x0F) << 4) + 8
+    if _exponent:
+        _sample = (_sample + 0x100) << (_exponent - 1)
+    ALAW_DECODE_TABLE[_index] = _sample if _alaw & 0x80 else -_sample
+
 
 def alaw2lin(data: bytes) -> bytes:
-    """PCMA (A-Law) verisini 16-bit PCM verisine dönüştürür."""
-    pcm_data = bytearray(len(data) * 2)
-    for i in range(len(data)):
-        val = ALAW_DECODE_TABLE[data[i]]
-        struct.pack_into("<h", pcm_data, i * 2, val)
-    return bytes(pcm_data)
+    """PCMA/A-law baytlarını little-endian signed 16-bit PCM'e çevirir."""
+    output = bytearray(len(data) * 2)
+    for index, value in enumerate(data):
+        struct.pack_into("<h", output, index * 2, ALAW_DECODE_TABLE[value])
+    return bytes(output)
+
+
+def _linear_sample_to_alaw(sample: int) -> int:
+    # Sun/ITU G.711 referans algoritması. A-law işaret biti pozitif örneklerde
+    # set edilir; son adımda çift bitler 0x55 ile terslenir.
+    mask = 0xD5
+    if sample < 0:
+        mask = 0x55
+        # -1..-7 aralığında bias sonrası negatif değer üretmek bytes()
+        # dönüşümünü kırıyordu. G.711 giriş büyüklüğü sıfırın altına inemez.
+        sample = max(0, -sample - 8)
+    sample = min(sample, 32635)
+    if sample < 256:
+        encoded = sample >> 4
+    else:
+        exponent = max(1, sample.bit_length() - 8)
+        encoded = (exponent << 4) | ((sample >> (exponent + 3)) & 0x0F)
+    return encoded ^ mask
+
 
 def lin2alaw(data: bytes) -> bytes:
-    """16-bit PCM (wav) verisini PCMA (A-Law) verisine dönüştürür."""
-    alaw_data = bytearray(len(data) // 2)
-    for i in range(len(alaw_data)):
-        val = struct.unpack_from("<h", data, i * 2)[0]
-        
-        sign = 0x80 if val < 0 else 0x00
-        if val < 0:
-            val = -val
-            
-        if val > 32767:
-            val = 32767
-            
-        exponent = 7
-        mask = 0x4000
-        
-        if val < 256:
-            exponent = 0
-            mantissa = (val >> 4) & 0x0F
-        else:
-            while (val & mask) == 0 and exponent > 0:
-                exponent -= 1
-                mask >>= 1
-            mantissa = (val >> (exponent + 3)) & 0x0F
-            
-        alaw = sign | (exponent << 4) | mantissa
-        alaw ^= 0x55
-        alaw_data[i] = alaw
-    return bytes(alaw_data)
+    """Little-endian signed 16-bit PCM'i PCMA/A-law'a çevirir."""
+    usable = len(data) - (len(data) % 2)
+    return bytes(
+        _linear_sample_to_alaw(sample[0])
+        for sample in struct.iter_unpack("<h", data[:usable])
+    )
 
 
 class RTPServerProtocol(asyncio.DatagramProtocol):
-    def __init__(self, remote_ip: str, remote_port: int, pipeline: VoicePipeline):
+    """Tek SIP diyaloğunun simetrik RTP akışını taşır.
+
+    ``on_pcm`` AudioSocket tabanlı çalışan konuşma çekirdeğine 20 ms PCM
+    kareleri verir. Çıkışta çekirdeğin PCM'i mutlaka PCMA'ya kodlanır.
+    """
+
+    def __init__(
+        self,
+        remote_ip: str,
+        remote_port: int,
+        on_pcm: Callable[[bytes], None],
+        payload_type: int = 8,
+        dtmf_payload_type: int = 101,
+    ) -> None:
         self.remote_ip = remote_ip
         self.remote_port = remote_port
-        self.pipeline = pipeline
-        self.transport = None
-        self.sequence_number = 0
-        self.timestamp = 0
-        import random
-        self.ssrc = random.randint(10000, 999999)
-        self._greeting_sent = False
+        self.on_pcm = on_pcm
+        self.payload_type = payload_type
+        self.dtmf_payload_type = dtmf_payload_type
+        self.transport: asyncio.DatagramTransport | None = None
+        self.sequence_number = random.randrange(0x10000)
+        self.timestamp = random.randrange(0x100000000)
+        self.ssrc = random.randrange(1, 0x100000000)
+        self._outbound_audio: deque[tuple[float, np.ndarray]] = deque()
+        self._echo_suppressed = 0
 
-    def connection_made(self, transport):
-        self.transport = transport
-        logger.info("RTP Sunucusu başlatıldı ve bağlandı. Hedef: %s:%s", self.remote_ip, self.remote_port)
-        
-        # Asenkron pipeline işçilerini başlat
-        self.pipeline.start(self.send_audio)
-        
-        self._greeting_sent = False
-        asyncio.create_task(self._delayed_greeting())
-        
-        # PBX'in çağrıyı düşürmesini engellemek için keepalive başlat
-        self._keepalive_task = asyncio.create_task(self._rtp_keepalive())
-        
-    async def _rtp_keepalive(self):
-        """Eğer uzun süre sessizlik olursa veya işlem sürüyorsa PBX'in çağrıyı kesmemesi için boş RTP yollar."""
-        while self.transport and not self.transport.is_closing():
-            await asyncio.sleep(2.0)
-            if self.pipeline.session.state == SessionState.PROCESSING:
-                # PCMA/8000 için 20 ms = 160 bayt.
-                silence = b'\xd5' * 160
-                await self.send_audio(silence)
-        
-    async def _delayed_greeting(self):
-        await self._send_greeting()
-        
-    async def _send_greeting(self):
-        if self._greeting_sent:
+    def connection_made(self, transport: asyncio.BaseTransport) -> None:
+        self.transport = transport  # type: ignore[assignment]
+        logger.info(
+            "Doğrudan RTP hazır remote=%s:%s codec=PCMA/8000",
+            self.remote_ip,
+            self.remote_port,
+        )
+
+    @staticmethod
+    def _payload(data: bytes) -> tuple[int, bytes] | None:
+        if len(data) < 12 or data[0] >> 6 != 2:
+            return None
+        csrc_count = data[0] & 0x0F
+        offset = 12 + (csrc_count * 4)
+        if len(data) < offset:
+            return None
+        if data[0] & 0x10:
+            if len(data) < offset + 4:
+                return None
+            extension_words = struct.unpack_from("!H", data, offset + 2)[0]
+            offset += 4 + extension_words * 4
+            if len(data) < offset:
+                return None
+        payload = data[offset:]
+        if data[0] & 0x20:
+            if not payload or payload[-1] > len(payload):
+                return None
+            payload = payload[:-payload[-1]]
+        return data[1] & 0x7F, payload
+
+    def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
+        parsed = self._payload(data)
+        if not parsed:
             return
-        self._greeting_sent = True
-        try:
-            self.pipeline.session.update_state(SessionState.SPEAKING)
-            
-            import os
-            greeting_file = os.path.join(os.path.dirname(__file__), "assets", "greeting.alaw")
-            
-            # Eğer dosya bulunamazsa (veya silinirse), loga uyarı yaz ve eski dinamik (on-the-fly) metoda dön
-            if not os.path.exists(greeting_file):
-                logger.warning("⚠️ Hazır açılış sesi (%s) bulunamadı! Eski davranışa dönülüyor (Dinamik TTS)...", greeting_file)
-                greeting_text = "Merhaba. RandevumOnline yapay zeka asistanına hoş geldiniz. Size yardımcı olabilmem için lütfen randevu talebinizi söyleyebilirsiniz."
-                async for chunk in self.pipeline.tts.synthesize_stream(greeting_text):
-                    if self.pipeline.interrupt_event.is_set():
-                        logger.info("🛑 Barge-in: Dinamik açılış mesajı kesildi.")
-                        break
-                    await self.send_audio(chunk)
-                    await asyncio.sleep(len(chunk) / 8000.0)
-                
-                if not self.pipeline.interrupt_event.is_set():
-                    logger.info("✅ Dinamik açılış sesi müşteriye iletildi.")
-                    self.pipeline.session.update_state(SessionState.LISTENING)
-                return
-                    
-            logger.info("🎵 Hazır açılış sesi (%s) ağa gönderiliyor...", greeting_file)
-            with open(greeting_file, "rb") as f:
-                alaw_data = f.read()
-                
-            # Karşı tarafın SDP'de istediği ptime=20 değerine uy:
-            # PCMA/8000 sesinde 20 ms RTP payload'u 160 bayttır.
-            chunk_size = 160
-            for i in range(0, len(alaw_data), chunk_size):
-                if self.pipeline.interrupt_event.is_set():
-                    logger.info("🛑 Barge-in: Hazır açılış mesajı kesildi.")
-                    break
-                chunk = alaw_data[i:i+chunk_size]
-                if not chunk:
-                    break
-                await self.send_audio(chunk)
-                await asyncio.sleep(len(chunk) / 8000.0)
-                
-            if not self.pipeline.interrupt_event.is_set():
-                logger.info("✅ Hazır açılış sesi müşteriye başarıyla iletildi. Normal STT dinleme moduna geçiliyor.")
-                self.pipeline.session.update_state(SessionState.LISTENING)
-                
-        except Exception as e:
-            logger.error("Greeting hatası: %s", e)
-            self.pipeline.session.update_state(SessionState.LISTENING)
-
-    def datagram_received(self, data, addr):
-        # Update remote IP and port for symmetric RTP
-        if self.remote_ip != addr[0] or self.remote_port != addr[1]:
-            self.remote_ip = addr[0]
-            self.remote_port = addr[1]
-            logger.info("RTP Hedef adresi güncellendi (Symmetric RTP): %s:%s", self.remote_ip, self.remote_port)
-
-        # RTP Header 12 byte'dır
-        if len(data) < 12:
+        payload_type, payload = parsed
+        if payload_type != self.payload_type or not payload:
             return
-        
-        # RTP paketi
-        payload_type = data[1] & 0x7F
-        # Sadece PCMA (A-Law) = 8
-        if payload_type == 8:
-            payload = data[12:]
-            pcm_audio = alaw2lin(payload)
-            # Tüm paketleri pipeline'ın audio worker'ına (queue'ya) at
-            self.pipeline.feed_audio(pcm_audio)
-
-    async def send_audio(self, pcm_data: bytes) -> None:
-        """Pipeline tarafından üretilen ALAW verisini doğrudan yollar."""
-        if not self.transport or self.transport.is_closing():
+        # Netgsm/Asterisk'teki rtp_symmetric davranışını koru: ilk gerçek medya
+        # paketinin kaynak adresi SDP'den farklıysa cevapları oraya gönder.
+        if (self.remote_ip, self.remote_port) != addr:
+            self.remote_ip, self.remote_port = addr
+            logger.info("Simetrik RTP hedefi güncellendi remote=%s:%s", *addr)
+        pcm = alaw2lin(payload)
+        if self._is_playback_echo(pcm):
+            self._echo_suppressed += 1
+            if self._echo_suppressed == 1 or self._echo_suppressed % 50 == 0:
+                logger.info(
+                    "RTP oynatma yankısı bastırıldı frames=%d",
+                    self._echo_suppressed,
+                )
             return
-            
-        alaw_data = pcm_data
-        
-        # PCMA (A-Law) verisi her byte için 1 sample demektir.
-        samples = len(alaw_data)
-        
-        # RTP header (12 bytes)
-        # Version(2) Padding(0) Extension(0) CSRC_count(0) = 0x80
-        # Marker(0) PayloadType(8 = PCMA) = 0x08
-        header = struct.pack("!BBHII", 
-                             0x80, 
-                             0x08, 
-                             self.sequence_number, 
-                             self.timestamp, 
-                             self.ssrc)
-                             
-        rtp_packet = header + alaw_data
-        
-        try:
-            self.transport.sendto(rtp_packet, (self.remote_ip, self.remote_port))
-            self.sequence_number = (self.sequence_number + 1) & 0xFFFF
-            self.timestamp = (self.timestamp + samples) & 0xFFFFFFFF
-        except Exception as e:
-            logger.error("RTP Gönderme hatası: %s", e)
+        self.on_pcm(pcm)
+
+    def _is_playback_echo(self, pcm_data: bytes) -> bool:
+        """Yakın zamanda gönderilen sesin hat üzerinden dönen kopyasını ayıklar.
+
+        Kullanıcının eşzamanlı konuşması yankıyla aynı dalga biçimine sahip
+        olmadığından korelasyonu düşürür ve barge-in olarak iletilmeye devam eder.
+        """
+        from app.voice.config import get_voice_settings
+
+        cfg = get_voice_settings()
+        now = time.monotonic()
+        window_s = max(0.2, cfg.voice_rtp_echo_window_ms / 1000.0)
+        while self._outbound_audio and now - self._outbound_audio[0][0] > window_s:
+            self._outbound_audio.popleft()
+        if len(self._outbound_audio) < 2:
+            return False
+        incoming = np.frombuffer(pcm_data, dtype="<i2").astype(np.float32)[::4]
+        incoming -= float(incoming.mean())
+        incoming_norm = float(np.linalg.norm(incoming))
+        if incoming_norm < 250.0:
+            return False
+        frames = list(self._outbound_audio)
+        threshold = cfg.voice_rtp_echo_correlation
+        # RTP saatlerinin fazı farklı olabilir. Komşu iki 20 ms kare içinde
+        # 2.5 ms adımlarla kaydırarak karşılaştır.
+        for index in range(len(frames) - 1):
+            candidate = np.concatenate((frames[index][1], frames[index + 1][1]))
+            for offset in range(0, len(frames[index][1]) + 1, 10):
+                part = candidate[offset:offset + len(incoming)].copy()
+                if len(part) != len(incoming):
+                    continue
+                part -= float(part.mean())
+                denominator = incoming_norm * float(np.linalg.norm(part))
+                if denominator and abs(float(np.dot(incoming, part)) / denominator) >= threshold:
+                    return True
+        return False
+
+    def send_pcm(self, pcm_data: bytes) -> None:
+        if not self.transport or self.transport.is_closing() or not pcm_data:
+            return
+        alaw_data = lin2alaw(pcm_data)
+        played_pcm = alaw2lin(alaw_data)
+        played = np.frombuffer(played_pcm, dtype="<i2").astype(np.float32)[::4]
+        self._outbound_audio.append((time.monotonic(), played))
+        header = struct.pack(
+            "!BBHII",
+            0x80,
+            self.payload_type,
+            self.sequence_number,
+            self.timestamp,
+            self.ssrc,
+        )
+        self.transport.sendto(
+            header + alaw_data, (self.remote_ip, self.remote_port)
+        )
+        self.sequence_number = (self.sequence_number + 1) & 0xFFFF
+        self.timestamp = (self.timestamp + len(alaw_data)) & 0xFFFFFFFF
+
+    def error_received(self, exc: Exception) -> None:
+        logger.warning("RTP UDP hatası type=%s", type(exc).__name__)

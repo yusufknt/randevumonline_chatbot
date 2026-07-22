@@ -70,6 +70,9 @@ async def init_indexes() -> None:
     )
 
     await db.staff.create_index([("business_id", 1), ("is_active", 1)])
+    await db.staff.create_index([
+        ("business_id", 1), ("is_active", 1), ("service_ids", 1),
+    ])
 
     await db.services.create_index([("business_id", 1), ("is_active", 1)])
     await db.services.create_index([("business_id", 1), ("category", 1)])
@@ -91,6 +94,14 @@ async def init_indexes() -> None:
 
     await db.appointments.create_index([
         ("business_id", 1), ("staff_id", 1), ("start_time", 1),
+    ])
+    await db.appointments.create_index([
+        ("business_id", 1), ("staff_id", 1), ("status", 1),
+        ("start_time", 1), ("end_time", 1),
+    ])
+    await db.appointments.create_index([
+        ("business_id", 1), ("status", 1), ("room_id", 1),
+        ("start_time", 1), ("end_time", 1),
     ])
     await db.appointments.create_index([
         ("business_id", 1), ("status", 1), ("start_time", 1),
@@ -273,6 +284,21 @@ async def append_conversation_message(conv_id: ObjectId, message: dict) -> None:
         {
             "$push": {"messages": message},
             "$set": {"last_active_at": message["timestamp"]},
+        },
+    )
+
+
+async def append_conversation_messages(
+    conv_id: ObjectId, messages: list[dict]
+) -> None:
+    """Bir konuşma mesaj grubunu tek MongoDB güncellemesiyle sıralı ekle."""
+    if not messages:
+        return
+    await get_db().conversations.update_one(
+        {"_id": conv_id},
+        {
+            "$push": {"messages": {"$each": messages}},
+            "$set": {"last_active_at": messages[-1]["timestamp"]},
         },
     )
 

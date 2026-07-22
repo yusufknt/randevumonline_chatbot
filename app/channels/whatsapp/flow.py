@@ -28,6 +28,7 @@ from app.core.db import (
     try_oid,
 )
 from app.core.format import truncate as _truncate
+from app.core.session_cache import get_booking_session_cache
 
 log = logging.getLogger(__name__)
 
@@ -107,34 +108,45 @@ async def _route(business: dict, conv_oid: ObjectId, payload: dict) -> dict:
         if isinstance(v, list):
             data[k] = v[0] if v else ""
     flow_token = payload.get("flow_token") or ""
+    cache_session_id = f"whatsapp-flow:{conv_oid}"
 
     if action == "data_exchange":
         if screen == "AD_SOYAD":
-            return await _build_service_screen(business, data)
+            return await _build_service_screen(business, data, cache_session_id)
         if screen == "SERVICE":
-            return await _build_staff_screen(business, data)
+            return await _build_staff_screen(business, data, cache_session_id)
         if screen == "STAFF":
-            return await _build_day_screen(business, data)
+            return await _build_day_screen(business, data, cache_session_id)
         if screen == "DAY":
-            return await _build_time_screen(business, data)
+            return await _build_time_screen(business, data, cache_session_id)
         if screen == "TIME":
-            return await _build_confirm_screen(business, data)
+            return await _build_confirm_screen(business, data, cache_session_id)
         if screen == "CONFIRM":
             return await _confirm_complete(business, conv_oid, data, flow_token)
 
     if action == "BACK":
-        return await _refresh_screen(business, screen, data)
+        return await _refresh_screen(business, screen, data, cache_session_id)
 
     log.warning("Bilinmeyen Flow action: %s screen=%s", action, screen)
     return _err_to_screen(screen or "AD_SOYAD", "İstek anlaşılamadı.")
 
 
-async def _build_service_screen(business: dict, data: dict) -> dict:
+async def _build_service_screen(
+    business: dict, data: dict, cache_session_id: str,
+) -> dict:
     db = get_db()
-    cursor = db.services.find(
-        {"business_id": business["_id"], "is_active": True}
+
+    async def load_services() -> list[dict]:
+        cursor = db.services.find(
+            {"business_id": business["_id"], "is_active": True}
+        )
+        return [s async for s in cursor]
+
+    services_raw = await get_booking_session_cache().get_or_load(
+        cache_session_id,
+        ("services", str(business["_id"])),
+        load_services,
     )
-    services_raw = [s async for s in cursor]
     log.info("SERVICE build: business=%s active_services=%d",
              business.get("business_id"), len(services_raw))
     services = []
@@ -164,23 +176,20 @@ async def _build_service_screen(business: dict, data: dict) -> dict:
     }
 
 
-async def _build_staff_screen(business: dict, data: dict) -> dict:
+async def _build_staff_screen(
+    business: dict, data: dict, cache_session_id: str,
+) -> dict:
     db = get_db()
     sid = try_oid(data.get("service_id"))
     if not sid:
         return _err_to_screen("SERVICE", "Hizmet seçimi anlaşılamadı.")
-    service = await db.services.find_one(
-        {"_id": sid, "business_id": business["_id"]}
-    )
+    service = await _cached_service(db, business, sid, cache_session_id)
     if not service:
         return _err_to_screen("SERVICE", "Hizmet bulunamadı.")
 
-    cursor = db.staff.find({
-        "business_id": business["_id"],
-        "is_active": True,
-        "service_ids": sid,
-    })
-    staff_list = [s async for s in cursor]
+    staff_list, _ = await _resolve_staff_list(
+        db, business, service, "any", cache_session_id
+    )
     if not staff_list:
         return _err_to_screen("SERVICE", "Bu hizmeti verecek personel yok.")
 
@@ -192,7 +201,7 @@ async def _build_staff_screen(business: dict, data: dict) -> dict:
             "service_name": service["name"],
             "staff_id":   str(only["_id"]),
             "staff_name": only["name"],
-        })
+        }, cache_session_id)
 
     options: list[dict] = [{"id": "any", "title": "Fark etmez"}]
     for st in staff_list[:MAX_VISIBLE_ROWS - 1]:
@@ -213,20 +222,20 @@ async def _build_staff_screen(business: dict, data: dict) -> dict:
     }
 
 
-async def _build_day_screen(business: dict, data: dict) -> dict:
+async def _build_day_screen(
+    business: dict, data: dict, cache_session_id: str,
+) -> dict:
     db = get_db()
     sid = try_oid(data.get("service_id"))
     if not sid:
         return _err_to_screen("SERVICE", "Hizmet seçimi anlaşılamadı.")
-    service = await db.services.find_one(
-        {"_id": sid, "business_id": business["_id"]}
-    )
+    service = await _cached_service(db, business, sid, cache_session_id)
     if not service:
         return _err_to_screen("SERVICE", "Hizmet bulunamadı.")
 
     raw_staff = data.get("staff_id") or "any"
     staff_list, staff_name = await _resolve_staff_list(
-        db, business, service, raw_staff
+        db, business, service, raw_staff, cache_session_id
     )
     if not staff_list:
         return _err_to_screen("STAFF", "Personel bulunamadı.")
@@ -235,10 +244,13 @@ async def _build_day_screen(business: dict, data: dict) -> dict:
     today = datetime.now(tz).date()
     ai = business.get("ai_settings") or {}
     days_to_scan = min(int(ai.get("max_advance_days", 60)), DAYS_TO_SCAN_MAX)
+    step = max(5, int(ai.get("online_slot_step_minutes", DEFAULT_SLOT_STEP_MIN)))
     days = []
     for i in range(days_to_scan):
         d = today + timedelta(days=i)
-        if not await _day_has_any_slot(db, business, service, staff_list, d):
+        if not await _day_has_any_slot(
+            db, business, service, staff_list, d, step, cache_session_id
+        ):
             continue
         days.append({"id": d.isoformat(),
                      "title": _truncate(_format_day_label(d), 30)})
@@ -266,7 +278,9 @@ async def _build_day_screen(business: dict, data: dict) -> dict:
     }
 
 
-async def _build_time_screen(business: dict, data: dict) -> dict:
+async def _build_time_screen(
+    business: dict, data: dict, cache_session_id: str,
+) -> dict:
     db = get_db()
     sid = try_oid(data.get("service_id"))
     day_iso = data.get("day") or ""
@@ -275,15 +289,16 @@ async def _build_time_screen(business: dict, data: dict) -> dict:
     except Exception:
         return _err_to_screen("DAY", "Gün anlaşılamadı.")
 
-    service = await db.services.find_one(
-        {"_id": sid, "business_id": business["_id"]}
-    ) if sid else None
+    service = (
+        await _cached_service(db, business, sid, cache_session_id)
+        if sid else None
+    )
     if not service:
         return _err_to_screen("SERVICE", "Hizmet bulunamadı.")
 
     raw_staff = data.get("staff_id") or "any"
     staff_list, staff_name = await _resolve_staff_list(
-        db, business, service, raw_staff
+        db, business, service, raw_staff, cache_session_id
     )
     if not staff_list:
         return _err_to_screen("STAFF", "Personel bulunamadı.")
@@ -296,8 +311,8 @@ async def _build_time_screen(business: dict, data: dict) -> dict:
     for st in staff_list:
         if is_in_time_off(st, target):
             continue
-        slots = await compute_available_slots(
-            db, business, service, st, target, step_minutes=step,
+        slots = await _cached_available_slots(
+            db, business, service, st, target, step, cache_session_id
         )
         for s in slots:
             local = s.astimezone(tz)
@@ -329,12 +344,15 @@ async def _build_time_screen(business: dict, data: dict) -> dict:
     }
 
 
-async def _build_confirm_screen(business: dict, data: dict) -> dict:
+async def _build_confirm_screen(
+    business: dict, data: dict, cache_session_id: str,
+) -> dict:
     db = get_db()
     sid = try_oid(data.get("service_id"))
-    service = await db.services.find_one(
-        {"_id": sid, "business_id": business["_id"]}
-    ) if sid else None
+    service = (
+        await _cached_service(db, business, sid, cache_session_id)
+        if sid else None
+    )
     if not service:
         return _err_to_screen("SERVICE", "Hizmet bulunamadı.")
 
@@ -343,9 +361,10 @@ async def _build_confirm_screen(business: dict, data: dict) -> dict:
     if raw_staff != "any":
         st_oid = try_oid(raw_staff)
         if st_oid:
-            st = await db.staff.find_one(
-                {"_id": st_oid, "business_id": business["_id"]}
+            staff_list, _ = await _resolve_staff_list(
+                db, business, service, raw_staff, cache_session_id
             )
+            st = staff_list[0] if staff_list else None
             if st:
                 staff_name = st["name"]
 
@@ -386,46 +405,109 @@ async def _build_confirm_screen(business: dict, data: dict) -> dict:
     }
 
 
-async def _refresh_screen(business: dict, screen: str | None, data: dict) -> dict:
+async def _refresh_screen(
+    business: dict, screen: str | None, data: dict, cache_session_id: str,
+) -> dict:
     if screen == "SERVICE":
-        return await _build_service_screen(business, data)
+        return await _build_service_screen(business, data, cache_session_id)
     if screen == "STAFF":
-        return await _build_staff_screen(business, data)
+        return await _build_staff_screen(business, data, cache_session_id)
     if screen == "DAY":
-        return await _build_day_screen(business, data)
+        return await _build_day_screen(business, data, cache_session_id)
     if screen == "TIME":
-        return await _build_time_screen(business, data)
+        return await _build_time_screen(business, data, cache_session_id)
     if screen == "CONFIRM":
-        return await _build_confirm_screen(business, data)
+        return await _build_confirm_screen(business, data, cache_session_id)
     return {"screen": "AD_SOYAD", "data": {}}
 
 
 async def _resolve_staff_list(
-    db, business: dict, service: dict, raw_staff: str,
+    db, business: dict, service: dict, raw_staff: str, cache_session_id: str,
 ) -> tuple[list[dict], str]:
-    if raw_staff == "any":
-        cursor = db.staff.find({
+    key = (
+        "staff",
+        str(business["_id"]),
+        str(service["_id"]),
+        raw_staff,
+    )
+
+    async def load_staff() -> list[dict]:
+        if raw_staff == "any":
+            cursor = db.staff.find({
+                "business_id": business["_id"],
+                "is_active": True,
+                "service_ids": service["_id"],
+            })
+            return [s async for s in cursor]
+        st_oid = try_oid(raw_staff)
+        if not st_oid:
+            return []
+        st = await db.staff.find_one({
+            "_id": st_oid,
             "business_id": business["_id"],
             "is_active": True,
-            "service_ids": service["_id"],
         })
-        staff_list = [s async for s in cursor]
-        return staff_list, "Fark etmez"
-    st_oid = try_oid(raw_staff)
-    if not st_oid:
-        return [], ""
-    st = await db.staff.find_one(
-        {"_id": st_oid, "business_id": business["_id"], "is_active": True}
+        if not st or service["_id"] not in (st.get("service_ids") or []):
+            return []
+        return [st]
+
+    staff_list = await get_booking_session_cache().get_or_load(
+        cache_session_id, key, load_staff
     )
-    if not st or service["_id"] not in (st.get("service_ids") or []):
+    if not staff_list:
         return [], ""
-    return [st], st["name"]
+    return staff_list, "Fark etmez" if raw_staff == "any" else staff_list[0]["name"]
 
 
+async def _cached_service(
+    db, business: dict, service_id: ObjectId, cache_session_id: str,
+) -> dict | None:
+    async def load_service() -> dict | None:
+        return await db.services.find_one(
+            {"_id": service_id, "business_id": business["_id"]}
+        )
+
+    return await get_booking_session_cache().get_or_load(
+        cache_session_id,
+        ("service", str(business["_id"]), str(service_id)),
+        load_service,
+    )
+
+
+async def _cached_available_slots(
+    db,
+    business: dict,
+    service: dict,
+    staff: dict,
+    target: date,
+    step: int,
+    cache_session_id: str,
+) -> list[datetime]:
+    key = (
+        "available_slots",
+        str(business["_id"]),
+        str(service["_id"]),
+        str(staff["_id"]),
+        target.isoformat(),
+        step,
+    )
+
+    async def load_slots() -> list[datetime]:
+        return await compute_available_slots(
+            db, business, service, staff, target, step_minutes=step
+        )
+
+    return await get_booking_session_cache().get_or_load(
+        cache_session_id, key, load_slots
+    )
+# Rezervasyon tamamlama cache kullanmaz; aşağıdaki akış canlı DB doğrulamasıdır.
 async def _confirm_complete(
     business: dict, conv_oid: ObjectId, data: dict, flow_token: str,
 ) -> dict:
     db = get_db()
+    # Tamamlama canlı MongoDB verisiyle ve atomik çakışma kontrolüyle yapılır.
+    # Başarısız seçim sonrası geri dönülürse ekranlar da taze veri üretir.
+    get_booking_session_cache().clear_session(f"whatsapp-flow:{conv_oid}")
 
     first_name = (data.get("first_name") or "").strip()
     last_name  = (data.get("last_name") or "").strip()
@@ -567,7 +649,15 @@ def _confirm_error(data: dict, message: str) -> dict:
     }
 
 
-async def _day_has_any_slot(db, business, service, staff_list, d: date) -> bool:
+async def _day_has_any_slot(
+    db,
+    business,
+    service,
+    staff_list,
+    d: date,
+    step: int,
+    cache_session_id: str,
+) -> bool:
     closure = is_special_closure(business, d)
     if closure and closure.get("closed"):
         return False
@@ -577,7 +667,9 @@ async def _day_has_any_slot(db, business, service, staff_list, d: date) -> bool:
     for st in staff_list:
         if is_in_time_off(st, d):
             continue
-        slots = await compute_available_slots(db, business, service, st, d)
+        slots = await _cached_available_slots(
+            db, business, service, st, d, step, cache_session_id
+        )
         if slots:
             return True
     return False

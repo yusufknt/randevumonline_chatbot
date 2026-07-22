@@ -26,6 +26,9 @@ ENV/
 
 # Test / coverage
 *.wav
+!app/voice/assets/greeting.wav
+!app/voice/assets/opening.wav
+!app/voice/assets/booking_success.wav
 .pytest_cache/
 .coverage
 .coverage.*

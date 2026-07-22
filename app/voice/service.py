@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import logging
 from contextlib import asynccontextmanager
 
@@ -8,9 +7,12 @@ from fastapi import FastAPI, Response
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from app.core.db import close_client, get_client, init_indexes
-from app.voice.audio_socket import start_audiosocket
+from app.core.session_cache import (
+    close_voice_session_cache,
+    get_voice_session_cache,
+)
 from app.voice.config import get_voice_settings
-from app.voice.fastagi import start_fastagi
+from app.voice.sip_server import start_sip_server
 from app.voice.stt import SpeechToTextEngine
 from app.voice.tts import TextToSpeechEngine
 
@@ -29,25 +31,25 @@ async def lifespan(app: FastAPI):
         raise RuntimeError("Eksik kritik ayarlar: " + ", ".join(missing))
     await get_client().admin.command("ping")
     await init_indexes()
+    redis_ok = await get_voice_session_cache().ping()
+    if not redis_ok:
+        log.warning("Redis kullanılamıyor; voice cache L1/MongoDB fallback ile çalışacak")
     await TextToSpeechEngine.startup()
     app.state.ready = False
-    app.state.agi = await start_fastagi()
-    app.state.audio = await start_audiosocket()
+    app.state.sip_transport, app.state.sip = await start_sip_server()
     await SpeechToTextEngine().warmup()
     app.state.ready = True
     log.info(
-        "Voice service hazır FastAGI=%s AudioSocket=%s",
-        cfg.voice_agi_port,
-        cfg.voice_audiosocket_port,
+        "Voice service hazır DirectSIP=udp/%s RTP=%s-%s",
+        cfg.voice_server_port,
+        cfg.rtp_start_port,
+        cfg.rtp_end_port,
     )
     yield
     app.state.ready = False
-    app.state.agi.close()
-    app.state.audio.close()
-    await asyncio.gather(
-        app.state.agi.wait_closed(), app.state.audio.wait_closed()
-    )
+    await app.state.sip.close()
     await TextToSpeechEngine.shutdown()
+    await close_voice_session_cache()
     await close_client()
 
 
@@ -62,7 +64,14 @@ async def health() -> dict:
         mongo = True
     except Exception:
         pass
-    return {"ok": mongo, "ready": bool(getattr(app.state, "ready", False))}
+    redis = await get_voice_session_cache().ping()
+    ready_value = bool(getattr(app.state, "ready", False))
+    return {
+        "ok": mongo,
+        "ready": ready_value,
+        "redis": redis,
+        "degraded": bool(mongo and ready_value and not redis),
+    }
 
 
 @app.get("/ready")

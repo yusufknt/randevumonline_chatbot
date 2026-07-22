@@ -89,6 +89,29 @@ class VoiceLLMFastBookingTests(unittest.IsolatedAsyncioTestCase):
         for item in reversed(self.patches):
             item.stop()
 
+    async def test_clear_farewell_closes_before_database_or_llm(self) -> None:
+        engine = VoiceLLMEngine()
+
+        response = await collect_response(engine, "Yok, teşekkür ederim.")
+
+        self.assertTrue(engine.is_session_closed)
+        self.assertIn("İyi günler", response)
+        VoiceToolExecutor.get_services.assert_not_awaited()
+        VoiceToolExecutor.get_staff.assert_not_awaited()
+
+    async def test_close_keywords_cover_natural_call_endings(self) -> None:
+        for text in (
+            "Başka bir isteğim yok.",
+            "Bu kadar.",
+            "Telefonu kapatabilirsin.",
+            "Tamamdır, iyi günler.",
+            "Görüşürüz.",
+        ):
+            with self.subTest(text=text):
+                engine = VoiceLLMEngine()
+                await collect_response(engine, text)
+                self.assertTrue(engine.is_session_closed)
+
     async def test_complete_sentence_books_without_second_llm_turn(self) -> None:
         engine = VoiceLLMEngine()
         target_year = date.today().year + (
@@ -128,7 +151,6 @@ class VoiceLLMFastBookingTests(unittest.IsolatedAsyncioTestCase):
         )
         fake_llm = FakeLLMClient(
             [
-                "Mehmet usta için hangi işlemi yaptırmak istersiniz?",
                 f"[RANDEVU: {target_year}-07-18 17:00 | Mehmet Kaya | "
                 "Saç Kesimi | Telefon Müşterisi]",
             ]
@@ -150,7 +172,7 @@ class VoiceLLMFastBookingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("oluşturuldu", second_response)
         call = VoiceToolExecutor.book_appointment.await_args.kwargs
         self.assertEqual(call["start_time_local"], f"{target_year}-07-18 17:00")
-        self.assertEqual(len(fake_llm.requests), 2)
+        self.assertEqual(len(fake_llm.requests), 1)
 
 
 if __name__ == "__main__":

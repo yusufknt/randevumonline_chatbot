@@ -88,7 +88,15 @@ class UtteranceSegmenter:
                 self.noise_floor
                 * (self.energy_multiplier + (1.5 if assistant_speaking else 0.0)),
             )
-            voiced = probability >= threshold or rms >= energy_threshold
+            if assistant_speaking:
+                # AI konuşurken çevre sesi stream'i kesmesin: hem konuşma hem
+                # yakınlık ve süre şartı birlikte aranır.
+                voiced = probability >= threshold and rms >= energy_threshold
+            else:
+                # AI sustuktan sonra müşteri hiçbir cihaz kazancında kilitli
+                # kalmasın. Silero konuşması veya belirgin yakın ses dinlemeyi
+                # başlatabilir; STT ayrıca halüsinasyon filtresinden geçer.
+                voiced = probability >= threshold or rms >= energy_threshold
             if not self.speaking and not voiced and not assistant_speaking:
                 self.noise_floor = (self.noise_floor * 0.97) + (rms * 0.03)
             if not self.speaking:

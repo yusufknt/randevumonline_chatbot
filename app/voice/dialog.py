@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import asyncio
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Any
@@ -19,13 +20,14 @@ from app.core.availability import (
 )
 from app.core.booking import cancel_appointment, create_appointment, reschedule_appointment
 from app.core.db import (
-    append_conversation_message,
     get_db,
     upsert_conversation,
     upsert_customer_by_phone,
 )
+from app.core.session_cache import get_voice_session_cache
 from app.voice.config import get_voice_settings
 from app.voice.llm import parse_target_date_tr
+from app.voice.message_buffer import ConversationMessageBuffer
 
 log = logging.getLogger(__name__)
 
@@ -99,7 +101,10 @@ def _time_from_text(text: str, *, allow_bare: bool = False) -> str | None:
     m = re.search(r"\b([01]?\d|2[0-3])[:.]([0-5]\d)\b", text)
     if m:
         return f"{int(m.group(1)):02d}:{m.group(2)}"
-    m = re.search(r"(?:saat\s+)([01]?\d|2[0-3])(?:\s*(buçuk))?", text.lower())
+    m = re.search(
+        r"(?:saat\s+)([01]?\d|2[0-3])(?![\d:.])(?:\s*(buçuk))?",
+        text.lower(),
+    )
     if m:
         hour = int(m.group(1))
         if 1 <= hour <= 7:
@@ -140,7 +145,67 @@ def _time_from_text(text: str, *, allow_bare: bool = False) -> str | None:
     return None
 
 
+def _invalid_explicit_date(text: str) -> bool:
+    """32 Temmuz gibi takvimde bulunmayan açık tarihleri yakala."""
+    months = {
+        "ocak": 1, "şubat": 2, "mart": 3, "nisan": 4, "mayıs": 5,
+        "haziran": 6, "temmuz": 7, "ağustos": 8, "eylül": 9,
+        "ekim": 10, "kasım": 11, "aralık": 12,
+    }
+    month_pattern = "|".join(months)
+    match = re.search(
+        rf"\b(\d{{1,2}})\s*({month_pattern})(?:\s+(\d{{4}}))?\b",
+        text.casefold(),
+    )
+    if not match:
+        return False
+    day = int(match.group(1))
+    month = months[match.group(2)]
+    year = int(match.group(3)) if match.group(3) else date.today().year
+    try:
+        date(year, month, day)
+    except ValueError:
+        return True
+    return False
+
+
+def _invalid_explicit_time(text: str) -> bool:
+    """Saat 28 ve 12:75 gibi saat aralığı dışındaki ifadeleri yakala."""
+    lower = text.casefold()
+    numeric = re.search(r"\bsaat\s+(\d{1,2})(?:[:.](\d{1,2}))?\b", lower)
+    if not numeric:
+        numeric = re.search(r"\b(\d{1,2})[:.](\d{2})\b", lower)
+    if numeric:
+        hour = int(numeric.group(1))
+        minute = int(numeric.group(2) or 0)
+        return hour > 23 or minute > 59
+
+    units = {
+        "sıfır": 0, "bir": 1, "iki": 2, "üç": 3, "dört": 4,
+        "beş": 5, "altı": 6, "yedi": 7, "sekiz": 8, "dokuz": 9,
+    }
+    tens = {
+        "on": 10, "yirmi": 20, "otuz": 30, "kırk": 40, "elli": 50,
+        "altmış": 60, "yetmiş": 70, "seksen": 80, "doksan": 90,
+    }
+    word = re.search(
+        r"\bsaat\s+(sıfır|bir|iki|üç|dört|beş|altı|yedi|sekiz|dokuz|"
+        r"on|yirmi|otuz|kırk|elli|altmış|yetmiş|seksen|doksan)"
+        r"(?:\s+(bir|iki|üç|dört|beş|altı|yedi|sekiz|dokuz))?\b",
+        lower,
+    )
+    if not word:
+        return False
+    first, second = word.group(1), word.group(2)
+    hour = (tens.get(first) if first in tens else units[first]) + (
+        units.get(second, 0) if first in tens else 0
+    )
+    return hour > 23
+
+
 def _has_date(text: str) -> bool:
+    if _invalid_explicit_date(text):
+        return False
     words = (
         "bugün", "yarın", "öbür gün", "pazartesi", "salı", "çarşamba",
         "perşembe", "cuma", "cumartesi", "pazar", "ocak", "şubat", "mart",
@@ -198,13 +263,64 @@ def _no(text: str) -> bool:
 
 
 def _no_more_requests(text: str) -> bool:
-    """Takip sorusuna verilen kısa ve kesin olumsuz cevabı ayırt eder."""
-    normalized = re.sub(r"[^\wçğıöşü]+", " ", text.casefold()).strip()
-    return bool(re.fullmatch(
-        r"(?:hayır(?:\s+yok)?|yok|başka\s+(?:bir\s+)?(?:isteğim\s+)?yok|"
-        r"istemiyorum|bu\s+kadar|teşekkürler|sağ\s+ol|yok\s+teşekkürler)",
+    """Takip sorusuna verilen kesin olumsuz cevabı ayırt eder.
+
+    Telefon STT'si kısa cevapları bazen ``hayır, yok, yok`` gibi tekrarlı
+    döndürebilir. Tekrarları kabul et; ancak ``yok ama ...`` biçiminde yeni bir
+    talebe bağlanan cümleyi kapanış sayma.
+    """
+    # Python'da büyük Türkçe İ casefold sonrası ``i`` + birleşen nokta olur;
+    # telefon STT'sinden gelen "İstemiyorum" ifadesini iki kelimeye bölme.
+    folded = text.casefold().replace("i\u0307", "i")
+    normalized = re.sub(r"[^\wçğıöşü]+", " ", folded).strip()
+    if not normalized or re.search(r"\bama\b", normalized):
+        return False
+    # Teşekkür/veda sözcüğünün yanında açık bir işlem talebi varsa görüşmeyi
+    # kapatma; kullanıcı takip sorusuna doğrudan yeni talebiyle cevap verebilir.
+    if re.search(
+        r"\b(?:randevu|istiyorum|isterim|oluştur|almak|iptal|değiştir|"
+        r"ertele|yarın|bugün|saat)\b",
         normalized,
-    ))
+    ):
+        return False
+
+    explicit_phrases = (
+        "başka bir isteğim yok",
+        "başka isteğim yok",
+        "başka bir şey yok",
+        "başka şey yok",
+        "başka yok",
+        "başka bir talebim yok",
+        "başka talebim yok",
+        "gerek yok",
+        "hepsi bu",
+        "bu kadardı",
+        "çok teşekkür",
+        "sağ olun",
+        "sağolun",
+        "konuşmayı sonlandır",
+        "konuşmaya sonlandır",
+        "kapatabilirsin",
+        "bu kadar",
+    )
+    if any(phrase in normalized for phrase in explicit_phrases):
+        return True
+
+    tokens = normalized.split()
+    allowed_tokens = {
+        "hayır", "hayir", "yok", "yoktur", "yo", "yoh", "istemiyorum",
+        "istemem", "teşekkür", "teşekkürler", "ederim", "sağ", "ol",
+        "olun", "sağol", "sağolun", "peki", "iyi", "günler", "başka",
+        "bir", "şey", "istek", "talep", "gerek", "hepsi", "bu", "kadar",
+        "kadardı",
+    }
+    closing_tokens = {
+        "hayır", "hayir", "yok", "yoktur", "yo", "yoh", "istemiyorum",
+        "istemem", "teşekkür", "teşekkürler",
+    }
+    return set(tokens) <= allowed_tokens and any(
+        token in closing_tokens for token in tokens
+    )
 
 
 def _yes_more_requests(text: str) -> bool:
@@ -227,6 +343,8 @@ class DialogManager:
         self.business = business
         self.caller = caller
         self.call_id = call_id
+        self._cache = get_voice_session_cache()
+        self._cache_session_id = f"voice:{call_id}"
         self.services: list[dict] = []
         self.staff: list[dict] = []
         self.customer: dict | None = None
@@ -237,24 +355,56 @@ class DialogManager:
         self.target_time: str | None = None
         self.pending: Pending | None = None
         self.closed = False
+        self.completion_kind: str | None = None
         self.history: list[dict[str, str]] = []
+        self._message_buffer: ConversationMessageBuffer | None = None
+
+    def clear_cache(self) -> None:
+        self._cache.clear_session(self._cache_session_id)
+
+    async def shutdown(self) -> None:
+        if self._message_buffer is not None:
+            await self._message_buffer.close(timeout_s=2.0)
+        await self._cache.clear_session_wait(self._cache_session_id)
 
     async def initialize(self) -> None:
         db = get_db()
-        self.services = await db.services.find(
-            {"business_id": self.business["_id"], "is_active": True}
-        ).to_list(100)
-        self.staff = await db.staff.find(
-            {"business_id": self.business["_id"], "is_active": True}
-        ).to_list(100)
-        self.customer = await upsert_customer_by_phone(
+
+        async def load_catalog() -> dict[str, list[dict]]:
+            services, staff = await asyncio.gather(
+                db.services.find({
+                    "business_id": self.business["_id"], "is_active": True,
+                }).to_list(100),
+                db.staff.find({
+                    "business_id": self.business["_id"], "is_active": True,
+                }).to_list(100),
+            )
+            return {"services": services, "staff": staff}
+
+        catalog_task = self._cache.get_or_load(
+            f"voice-catalog:{self.business['_id']}",
+            ("active_staff_services", str(self.business["_id"])),
+            load_catalog,
+            kind="catalog",
+        )
+        customer_task = upsert_customer_by_phone(
             self.business["_id"], self.caller, "Telefon Müşterisi"
         )
+        catalog, self.customer = await asyncio.gather(
+            catalog_task, customer_task
+        )
+        self.services = list(catalog.get("services") or [])
+        self.staff = list(catalog.get("staff") or [])
         self.conversation = await upsert_conversation(
             self.business["_id"], "voice", self.call_id, self.customer["_id"]
         )
+        self._message_buffer = ConversationMessageBuffer(
+            self.conversation["_id"]
+        )
 
-    def _match(self, text: str, docs: list[dict]) -> dict | None:
+    def _match(
+        self, text: str, docs: list[dict], *, fuzzy: bool = True
+    ) -> dict | None:
         names = [str(doc.get("name", "")) for doc in docs]
         searchable = re.sub(r"[^\w]+", " ", text.casefold(), flags=re.UNICODE)
         tokens = searchable.split()
@@ -280,8 +430,56 @@ class DialogManager:
                 first_name_matches.append(doc)
         if len(first_name_matches) == 1:
             return first_name_matches[0]
+        if not fuzzy:
+            return None
+
+        # Uzun bir randevu cümlesini hizmet adının tamamıyla karşılaştırmak,
+        # telefon STT'sindeki tek ek/harf hatasında skoru gereksiz düşürür.
+        # Yalnız hizmet/personel adı uzunluğundaki ardışık kelime pencerelerini
+        # değerlendir ve birbirinden açıkça ayrılan tek katalog sonucunu kabul et.
+        window_scores: list[tuple[float, int]] = []
+        for index, doc in enumerate(docs):
+            normalized_name = re.sub(
+                r"[^\w]+", " ", str(doc.get("name", "")).casefold(),
+                flags=re.UNICODE,
+            ).strip()
+            word_count = len(normalized_name.split())
+            if not normalized_name or not word_count or len(tokens) < word_count:
+                continue
+            score = max(
+                fuzz.ratio(" ".join(tokens[offset:offset + word_count]), normalized_name)
+                for offset in range(len(tokens) - word_count + 1)
+            )
+            window_scores.append((score, index))
+        window_scores.sort(reverse=True)
+        if window_scores and window_scores[0][0] >= 84:
+            runner_up = window_scores[1][0] if len(window_scores) > 1 else 0
+            if window_scores[0][0] - runner_up >= 5:
+                return docs[window_scores[0][1]]
+
         result = process.extractOne(text, names, scorer=fuzz.WRatio, score_cutoff=72)
         return docs[result[2]] if result else None
+
+    def is_probable_playback_echo(self, text: str) -> bool:
+        """Okunan listeyi geri döndüren hat yankısını kullanıcı seçimi sayma."""
+        searchable = re.sub(r"[^\w]+", " ", text.casefold(), flags=re.UNICODE)
+        tokens = set(searchable.split())
+        staff_hits = sum(
+            str(item.get("name", "")).casefold().split()[0] in tokens
+            for item in self.staff
+        )
+        if not self.staff_member and staff_hits >= 2:
+            return True
+        service_hits = sum(
+            re.sub(
+                r"[^\w]+",
+                " ",
+                str(item.get("name", "")).casefold(),
+                flags=re.UNICODE,
+            ).strip() in searchable
+            for item in self._available_services_for_selected_staff()
+        )
+        return bool(self.staff_member and not self.service and service_hits >= 2)
 
     def _spoken_staff_names(self) -> str:
         first_names = [str(item.get("name", "")).split()[0] for item in self.staff[:4]]
@@ -289,8 +487,53 @@ class DialogManager:
             return "".join(first_names)
         return ", ".join(first_names[:-1]) + " ve " + first_names[-1]
 
+    def _available_services_for_selected_staff(self) -> list[dict]:
+        """Seçilen personelin verebildiği aktif hizmetleri konuşma sırasıyla döndürür."""
+        if not self.staff_member:
+            return self.services
+        service_ids = set(self.staff_member.get("service_ids") or [])
+        return [item for item in self.services if item.get("_id") in service_ids]
+
+    @staticmethod
+    def _staff_allows_service(staff: dict, service: dict) -> bool:
+        return service.get("_id") in set(staff.get("service_ids") or [])
+
+    @staticmethod
+    def _spoken_names(items: list[dict]) -> str:
+        names = [str(item.get("name", "")).strip() for item in items if item.get("name")]
+        if not names:
+            return ""
+        if len(names) == 1:
+            return names[0]
+        return ", ".join(names[:-1]) + " ve " + names[-1]
+
+    def _staff_selection_prompt(self) -> str:
+        names = self._spoken_staff_names()
+        return (
+            f"Berberlerimiz: {names}. Hangisini tercih edersiniz?"
+            if names
+            else "Hangi berberimizi tercih edersiniz?"
+        )
+
+    def opening_prompt(self) -> str:
+        """Hazır karşılama bittikten sonra kesilebilir ilk diyalog sorusu."""
+        return self._staff_selection_prompt()
+
+    def _service_selection_prompt(self) -> str:
+        names = self._spoken_names(self._available_services_for_selected_staff())
+        return (
+            f"Hizmetlerimiz: {names}. Hangisini istersiniz?"
+            if names
+            else "Hangi işlemi yaptırmak istersiniz?"
+        )
+
     def stt_context(self) -> tuple[str, str]:
         """Whisper'ı yalnızca bu turda beklenen kelimelere yönlendirir."""
+        if self.pending and self.pending.action == "post_booking":
+            return (
+                "post_booking",
+                "Beklenen cevap: başka bir isteğim var, evet, hayır, yok veya yeni randevu talebi.",
+            )
         if self.pending and self.pending.action in {
             "create", "cancel", "reschedule_confirm"
         }:
@@ -330,9 +573,127 @@ class DialogManager:
             booking_context=state in {"date", "time", "general"}
             or bool(self.staff_member or self.service),
         )
+        # Telefon hattında "saç tıraşı" özellikle "saç trafiği" veya
+        # "saç daş" olarak çözülebiliyor. İşletmede Saç Kesimi gerçekten varsa
+        # yalnız bu dar ve gözlenmiş varyantları katalogdaki kesin ada çevir.
+        hair_service = next(
+            (
+                str(item.get("name"))
+                for item in self.services
+                if str(item.get("name", "")).casefold() == "saç kesimi"
+            ),
+            None,
+        )
+        if hair_service:
+            normalized = re.sub(
+                r"\bsaç\s+(?:tıraşı|traşı|tırışı|trafiği|trafigi|daş(?:ı)?)\b",
+                hair_service,
+                normalized,
+                flags=re.IGNORECASE,
+            )
         if state == "time":
             normalized = _repair_time_stt(normalized)
         return normalized
+
+    @staticmethod
+    def is_close_request(text: str) -> bool:
+        """Türkçe büyük İ ve noktalama farklarından bağımsız kesin vedayı yakala."""
+        folded = text.casefold().replace("i\u0307", "i")
+        normalized = re.sub(r"[^\wçğıöşü]+", " ", folded).strip()
+        if any(
+            phrase in normalized
+            for phrase in (
+                "iyi günler", "görüşürüz", "hoşça kal", "telefonu kapat",
+                "kapat", "konuşmayı sonlandır", "konuşmaya sonlandır",
+                "görüşmeyi sonlandır", "sonlandırabilirsin",
+            )
+        ):
+            return True
+        if "kolay gelsin" not in normalized:
+            return False
+        # "Kolay gelsin, yarın için randevu istiyorum" bir selamlamadır;
+        # yalnız yanında gerçek bir talep yoksa görüşme vedası kabul edilir.
+        request_words = (
+            "randevu", "almak", "istiyorum", "isterim", "müsait", "boş",
+            "iptal", "değiştir", "ertele", "usta", "berber", "hizmet",
+            "işlem", "yarın", "bugün", "saat",
+        )
+        return not any(word in normalized for word in request_words)
+
+    def accepts_low_confidence_transcript(self, text: str) -> bool:
+        """Yalnız mevcut adımda açıkça tanınan düşük güvenli cevabı kabul eder."""
+        if self.is_close_request(text):
+            return True
+        state, _ = self.stt_context()
+        if state == "staff":
+            return self._match(text, self.staff, fuzzy=False) is not None
+        if state == "service":
+            return self._match(
+                text,
+                self._available_services_for_selected_staff(),
+                fuzzy=False,
+            ) is not None
+        if state == "date":
+            return _has_date(_repair_date_stt(text, booking_context=True))
+        if state == "time":
+            # Hotword/yankı bazen "saat iki, saat on iki" gibi birden fazla
+            # aday üretir. Düşük güvende yalnız tek saat adayı kabul edilir.
+            if text.casefold().count("saat") > 1:
+                return False
+            return _time_from_text(text, allow_bare=True) is not None
+        if state == "confirmation":
+            return _yes(text) or _no(text)
+        if state == "post_booking":
+            return _no_more_requests(text) or _yes_more_requests(text)
+        return False
+
+    def low_confidence_retry_prompt(self) -> str:
+        state, _ = self.stt_context()
+        prompts = {
+            "staff": self._staff_selection_prompt(),
+            "service": self._service_selection_prompt(),
+            "date": "Hangi gün gelmek istersiniz?",
+            "time": "Saat kaçta gelmek istersiniz?",
+            "confirmation": "Onaylıyorsanız evet, değiştirmek istiyorsanız hayır deyin.",
+            "post_booking": "Başka bir isteğiniz varsa söyleyin, yoksa hayır deyin.",
+        }
+        return prompts.get(state, "Lütfen isteğinizi tekrar söyler misiniz?")
+
+    def sanitize_low_confidence_transcript(self, text: str) -> str:
+        """Düşük güvenli metinden yalnız kesin tanınan mevcut-adım değerini alır."""
+        if self.is_close_request(text):
+            return "kapat"
+        state, _ = self.stt_context()
+        if state == "staff":
+            matched = self._match(text, self.staff, fuzzy=False)
+            return str(matched.get("name")) if matched else ""
+        if state == "service":
+            matched = self._match(
+                text,
+                self._available_services_for_selected_staff(),
+                fuzzy=False,
+            )
+            return str(matched.get("name")) if matched else ""
+        if state == "date":
+            repaired = _repair_date_stt(text, booking_context=True)
+            if _has_date(repaired):
+                value, _ = parse_target_date_tr(repaired)
+                return _date_spoken(value)
+            return ""
+        if state == "time":
+            value = _time_from_text(text, allow_bare=True)
+            return f"saat {value}" if value else ""
+        if state == "confirmation":
+            if _yes(text):
+                return "evet"
+            if _no(text):
+                return "hayır"
+        if state == "post_booking":
+            if _no_more_requests(text):
+                return "yok"
+            if _yes_more_requests(text):
+                return "evet"
+        return ""
 
     async def _record(self, role: str, text: str) -> None:
         self.history.append({"role": role, "content": text})
@@ -340,8 +701,8 @@ class DialogManager:
         # metin geçmişini kısa tutmak uzun görüşmede eski ve düzeltilmiş
         # bilgilerin yeniden LLM bağlamına sızmasını engeller.
         self.history = self.history[-6:]
-        if self.conversation:
-            await append_conversation_message(self.conversation["_id"], {
+        if self._message_buffer is not None:
+            self._message_buffer.enqueue({
                 "role": role,
                 "content": text,
                 "timestamp": datetime.now(timezone.utc),
@@ -443,14 +804,27 @@ class DialogManager:
             return {}
 
     def _apply_entities(self, text: str, interpreted: dict[str, Any]) -> None:
-        service_text = interpreted.get("service") or text
-        staff_text = interpreted.get("staff") or text
-        matched_service = self._match(str(service_text), self.services)
-        matched_staff = self._match(str(staff_text), self.staff)
-        if matched_service:
-            self.service = matched_service
+        # LLM yalnız niyet sınıflandırır. Kullanıcının gerçek transkriptinde açık
+        # kanıtı olmayan hiçbir usta, hizmet, tarih veya saat oturuma yazılamaz.
+        matched_service = self._match(text, self.services)
+        matched_staff = self._match(text, self.staff)
         if matched_staff:
             self.staff_member = matched_staff
+        if matched_service:
+            if not self.staff_member or self._staff_allows_service(
+                self.staff_member, matched_service
+            ):
+                self.service = matched_service
+            else:
+                self.service = None
+        # Önce hizmet, sonra personel söylenmiş olabilir. Yeni personel mevcut
+        # hizmeti vermiyorsa yanlış kombinasyonla onaya ilerleme.
+        if (
+            self.staff_member
+            and self.service
+            and not self._staff_allows_service(self.staff_member, self.service)
+        ):
+            self.service = None
 
         date_text = _repair_date_stt(
             text,
@@ -461,15 +835,7 @@ class DialogManager:
                 or self.service
             ),
         )
-        parsed_date = interpreted.get("date")
-        if parsed_date:
-            try:
-                candidate = date.fromisoformat(str(parsed_date))
-                if candidate >= date.today():
-                    self.target_date = candidate
-            except ValueError:
-                pass
-        elif _has_date(date_text):
+        if _has_date(date_text):
             self.target_date, _ = parse_target_date_tr(date_text)
 
         expects_time = bool(
@@ -478,11 +844,38 @@ class DialogManager:
             and self.target_date
             and not self.target_time
         )
-        parsed_time = interpreted.get("time") or _time_from_text(
-            text, allow_bare=expects_time
-        )
+        parsed_time = _time_from_text(text, allow_bare=expects_time)
         if parsed_time and re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", str(parsed_time)):
             self.target_time = str(parsed_time)
+
+    def _complete_booking_is_explicit_in_text(self, text: str) -> bool:
+        """Dört rezervasyon alanının da aynı müşteri cümlesinde bulunduğunu doğrula."""
+        staff = self._match(text, self.staff)
+        service = self._match(text, self.services)
+        if not staff or not service or not self._staff_allows_service(staff, service):
+            return False
+        date_text = _repair_date_stt(text, booking_context=True)
+        if not _has_date(date_text):
+            return False
+        # Tek cümlede otomatik kayıt için çıplak sayı kabul edilmez; saat ifadesi
+        # transkriptte açıkça bulunmalıdır.
+        parsed_time = _time_from_text(text, allow_bare=False)
+        return bool(
+            parsed_time
+            and re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", parsed_time)
+        )
+
+    def _is_explicit_new_request(self, text: str) -> bool:
+        """Takip sorusundan sonra yalnız kesin yeni talepte rezervasyon durumunu aç."""
+        if self._local_intent(text) is not None:
+            return True
+        repaired = _repair_date_stt(text, booking_context=True)
+        return bool(
+            self._match(text, self.staff, fuzzy=False)
+            or self._match(text, self.services, fuzzy=False)
+            or _has_date(repaired)
+            or _time_from_text(text, allow_bare=False)
+        )
 
     def _apply_confirmation_correction(self, text: str) -> bool:
         """Onay reddiyle aynı cümlede verilen yeni alanı kaybetmeden uygular."""
@@ -497,7 +890,18 @@ class DialogManager:
         if matched_staff:
             self.staff_member = matched_staff
         if matched_service:
-            self.service = matched_service
+            if not self.staff_member or self._staff_allows_service(
+                self.staff_member, matched_service
+            ):
+                self.service = matched_service
+            else:
+                self.service = None
+        if (
+            self.staff_member
+            and self.service
+            and not self._staff_allows_service(self.staff_member, self.service)
+        ):
+            self.service = None
 
         parsed_time = _time_from_text(text, allow_bare=True)
         if parsed_time:
@@ -536,14 +940,7 @@ class DialogManager:
         assert self.target_date and self.target_time
         assert self.staff_member and self.service
         try:
-            slots = await compute_available_slots(
-                get_db(),
-                self.business,
-                self.service,
-                self.staff_member,
-                self.target_date,
-                step_minutes=15,
-            )
+            slots = await self._available_slots()
         except Exception as exc:
             log.warning("Onay öncesi müsaitlik kontrolü başarısız type=%s", type(exc).__name__)
             return "error"
@@ -576,14 +973,7 @@ class DialogManager:
     async def _availability_answer(self) -> str:
         """Tek tek saat okumadan, birleşik boş zaman aralıklarını söyler."""
         assert self.target_date and self.staff_member and self.service
-        slots = await compute_available_slots(
-            get_db(),
-            self.business,
-            self.service,
-            self.staff_member,
-            self.target_date,
-            step_minutes=15,
-        )
+        slots = await self._available_slots()
         if not slots:
             return "Bu gün uygun saat bulunmuyor. Başka bir gün seçmek ister misiniz?"
 
@@ -608,6 +998,32 @@ class DialogManager:
         return (
             f"{_date_spoken(self.target_date)} günü saat "
             f"{_format_slot_ranges(ranges)} müsait. Hangi saati istersiniz?"
+        )
+
+    async def _available_slots(self) -> list[datetime]:
+        """Seçili günün slotlarını çağrı oturumu boyunca kısa süreli saklar."""
+        assert self.target_date and self.staff_member and self.service
+        key = (
+            "available_slots",
+            str(self.business["_id"]),
+            str(self.service["_id"]),
+            str(self.staff_member["_id"]),
+            self.target_date.isoformat(),
+            15,
+        )
+
+        async def load() -> list[datetime]:
+            return await compute_available_slots(
+                get_db(),
+                self.business,
+                self.service,
+                self.staff_member,
+                self.target_date,
+                step_minutes=15,
+            )
+
+        return await self._cache.get_or_load(
+            self._cache_session_id, key, load, kind="availability"
         )
 
     async def _prepare_confirmation(
@@ -715,11 +1131,41 @@ class DialogManager:
         return None
 
     async def respond(self, text: str) -> str:
+        # AudioSocket bu düzeltmeyi STT sonrasında uygular; diğer çağrı yolları
+        # ve doğrudan testler de aynı tek-cümle davranışını kullansın.
+        text = self.normalize_stt_text(text)
         await self._record("user", text)
-        lower = text.lower()
-        if any(x in lower for x in ("görüşürüz", "iyi günler", "kapat", "hoşça kal")):
+        lower = text.casefold().replace("i\u0307", "i")
+        if self.is_close_request(text):
             self.closed = True
             answer = "Bizi aradığınız için teşekkür ederiz. İyi günler."
+            await self._record("assistant", answer)
+            return answer
+
+        if _invalid_explicit_date(text):
+            if self.pending and self.pending.action in {
+                "create", "reschedule_collect", "reschedule_confirm",
+            }:
+                self.pending = None
+            self.target_date = None
+            self.target_time = None
+            answer = (
+                "Bu tarih takvimde bulunmuyor. Lütfen geçerli bir tarih "
+                "söyler misiniz?"
+            )
+            await self._record("assistant", answer)
+            return answer
+
+        if _invalid_explicit_time(text):
+            if self.pending and self.pending.action in {
+                "create", "reschedule_collect", "reschedule_confirm",
+            }:
+                self.pending = None
+            self.target_time = None
+            answer = (
+                "Bu saat geçerli değil. Lütfen sıfır ile yirmi üç arasında "
+                "geçerli bir saat söyler misiniz?"
+            )
             await self._record("assistant", answer)
             return answer
 
@@ -730,13 +1176,36 @@ class DialogManager:
                 answer = "Peki, bizi aradığınız için teşekkür ederiz. İyi günler."
                 await self._record("assistant", answer)
                 return answer
-            self.pending = None
             if _yes_more_requests(text):
+                self.pending = None
+                self.staff_member = None
+                self.service = None
+                self.target_date = None
+                self.target_time = None
+                self.completion_kind = None
                 answer = "Tabii, başka nasıl yardımcı olabilirim?"
                 await self._record("assistant", answer)
                 return answer
-            # Kullanıcı evet demeden doğrudan yeni isteğini söylemiş olabilir;
-            # aynı cümleyi normal niyet akışında işlemeye devam et.
+            # Önceki onay cümlesinin yankısı veya FIFO'da kalan ikinci parçası
+            # yeni bir talep değildir. Durumu bozma ve LLM'e yorumlatma.
+            if "onay" in lower or _yes(text):
+                self.pending = Pending("post_booking")
+                answer = "Randevunuz hazır. Başka bir isteğiniz var mı?"
+                await self._record("assistant", answer)
+                return answer
+            if not self._is_explicit_new_request(text):
+                # Belirsiz STT sonucu yeni randevu sayılıp berber listesine
+                # düşmemeli; takip durumu korunur.
+                answer = "Randevunuz hazır. Başka bir isteğiniz var mı?"
+                await self._record("assistant", answer)
+                return answer
+            # Kullanıcı "evet" demeden doğrudan yeni isteğini söylemiş olabilir.
+            self.pending = None
+            self.staff_member = None
+            self.service = None
+            self.target_date = None
+            self.target_time = None
+            self.completion_kind = None
 
         if self.pending and self.pending.action == "create":
             if _yes(text):
@@ -786,8 +1255,16 @@ class DialogManager:
                 ok = await cancel_appointment(
                     get_db(), str(self.pending.appointment["_id"]), "voice_customer"
                 )
-                self.pending = None
-                answer = "Randevunuz iptal edildi." if ok else "Randevu iptal edilemedi."
+                if ok:
+                    self.clear_cache()
+                    self.pending = Pending("post_booking")
+                else:
+                    self.pending = None
+                answer = (
+                    "Randevunuz iptal edildi. Başka bir isteğiniz var mı?"
+                    if ok
+                    else "Randevu iptal edilemedi."
+                )
             elif _no(text):
                 self.pending = None
                 answer = "İptal işlemini durdurdum. Başka bir isteğiniz var mı?"
@@ -806,9 +1283,13 @@ class DialogManager:
                     self.service,
                     self.staff_member,
                 )
-                self.pending = None
+                if not result.get("error"):
+                    self.clear_cache()
+                    self.pending = Pending("post_booking")
+                else:
+                    self.pending = None
                 answer = (
-                    "Randevunuz değiştirildi."
+                    "Randevunuz değiştirildi. Başka bir isteğiniz var mı?"
                     if not result.get("error")
                     else "Randevu değiştirilemedi. Başka bir saat seçer misiniz?"
                 )
@@ -827,11 +1308,33 @@ class DialogManager:
             return fast_answer
 
         local_intent = self._local_intent(text)
-        # LLM yalnızca sohbet için değil, bozuk telefon transkriptindeki personel,
-        # hizmet, tarih ve saati bağlamdan çıkarmak için her normal turda çalışır.
-        interpreted = await self._interpret(text)
+        # Eksik alan adımlarında o alana veya başka bir randevu bilgisine ait
+        # hiçbir veri yoksa serbest LLM cevabı üretme. Böylece "merhaba" gibi
+        # FIFO/yankı parçaları işletme ve kişi adı uyduramaz.
+        matched_staff = self._match(text, self.staff)
+        matched_service = self._match(text, self.services)
+        has_date = _has_date(_repair_date_stt(text, booking_context=True))
+        has_time = _time_from_text(text, allow_bare=True) is not None
+        if not local_intent:
+            if not self.staff_member and not any((matched_staff, matched_service, has_date, has_time)):
+                answer = self._staff_selection_prompt()
+                await self._record("assistant", answer)
+                return answer
+            if self.staff_member and not self.service and not any((matched_service, has_date, has_time)):
+                answer = self._service_selection_prompt()
+                await self._record("assistant", answer)
+                return answer
+            if self.staff_member and self.service and not self.target_date and not any((has_date, has_time)):
+                answer = "Hangi gün gelmek istersiniz?"
+                await self._record("assistant", answer)
+                return answer
+        # Rezervasyon işlemleri deterministiktir: usta, hizmet, tarih ve saat
+        # yalnız gerçek STT metninden çıkarılır. Bu turlarda LLM çağrısı hem
+        # gecikme hem de söylenmeyen alan üretme riski oluşturur.
         if local_intent:
-            interpreted["intent"] = local_intent
+            interpreted: dict[str, Any] = {"intent": local_intent}
+        else:
+            interpreted = await self._interpret(text)
         intent = str(interpreted.get("intent") or "").lower()
         if intent not in {
             "create", "list", "cancel", "reschedule", "availability", "close", "other"
@@ -851,19 +1354,20 @@ class DialogManager:
 
         if intent == "close":
             self.closed = True
-            answer = interpreted.get("answer") or "Bizi aradığınız için teşekkür ederiz. İyi günler."
+            answer = "Bizi aradığınız için teşekkür ederiz. İyi günler."
             await self._record("assistant", answer)
-            return str(answer)
+            return answer
 
         if intent == "other":
-            answer = interpreted.get("answer")
-            if not answer:
-                answer = (
-                    "Sorunuzu anlayamadım. Randevu oluşturma, uygunluk, iptal veya "
-                    "değişiklik konusunda yardımcı olabilirim."
-                )
-            await self._record("assistant", str(answer))
-            return str(answer)
+            # LLM serbest sohbet metni üretemez; yalnız niyet ve alan çıkarır.
+            # Böylece işletme/kişi adı veya kullanıcının söylemediği ayrıntılar
+            # telefonda kendiliğinden uydurulmaz.
+            answer = (
+                "Sorunuzu anlayamadım. Randevu oluşturma, uygunluk, iptal veya "
+                "değişiklik konusunda yardımcı olabilirim."
+            )
+            await self._record("assistant", answer)
+            return answer
 
         if intent in {"list", "cancel", "reschedule"}:
             appointments = await self._appointments()
@@ -890,12 +1394,19 @@ class DialogManager:
                 (s for s in self.staff if s["_id"] == apt["staff_id"]), None
             )
 
+        complete_single_utterance = (
+            intent == "create"
+            and not (
+                self.pending and self.pending.action == "reschedule_collect"
+            )
+            and self._complete_booking_is_explicit_in_text(text)
+        )
         self._apply_entities(text, interpreted)
 
         if not self.staff_member:
-            answer = "Tabii, hangi berberi tercih edersiniz?"
+            answer = self._staff_selection_prompt()
         elif not self.service:
-            answer = "Peki, hangi işlemi yaptırmak istersiniz?"
+            answer = self._service_selection_prompt()
         elif not self.target_date:
             answer = "Hangi gün gelmek istersiniz?"
         elif not self.target_time:
@@ -908,6 +1419,14 @@ class DialogManager:
             )
             appointment = self.pending.appointment if self.pending else None
             answer = await self._prepare_confirmation(action, appointment)
+            if (
+                complete_single_utterance
+                and self.pending
+                and self.pending.action == "create"
+            ):
+                # _prepare_confirmation canlı müsaitliği doğruladı. Son kayıt
+                # yine create_appointment içindeki atomik çakışma kontrolünden geçer.
+                answer = await self._commit_create()
         await self._record("assistant", answer)
         return answer
 
@@ -929,17 +1448,19 @@ class DialogManager:
         )
         self.pending = None
         if result.get("error") == "slot_taken":
+            self.clear_cache()
             self.target_time = None
             return "Bu saat az önce doldu. Başka bir saat seçer misiniz?"
         if result.get("error"):
             return "Randevu kaydedilemedi. Lütfen tekrar deneyin."
+        self.clear_cache()
         summary = (
             f"{_date_spoken(self.target_date)} saat {self.target_time}, "
             f"{self.staff_member['name']} ile {self.service['name']}"
         )
         self.service = self.staff_member = self.target_date = self.target_time = None
         self.pending = Pending("post_booking")
-        return (
-            f"Tamamdır, {summary} için randevunuzu oluşturdum. "
-            "Başka bir isteğiniz var mı?"
-        )
+        self.closed = False
+        self.completion_kind = None
+        log.info("Randevu başarıyla oluşturuldu call_id=%s summary=%s", self.call_id, summary)
+        return "Randevunuz oluşturuldu. Başka bir isteğiniz var mı?"

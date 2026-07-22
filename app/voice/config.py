@@ -22,17 +22,18 @@ class VoiceSettings(BaseSettings):
     voice_server_host: str = "0.0.0.0"
     voice_server_port: int = 8010
     voice_external_ip: str | None = None
+    # Netgsm WireGuard SIP eşinin adresi. Virgülle birden fazla adres verilebilir;
+    # boş değer veya yıldız yalnız kontrollü test ortamında kullanılmalıdır.
+    voice_sip_allowed_hosts: str = "10.203.0.1"
     
     # RTP Sunucu Ayarları
     rtp_start_port: int = 10000
     rtp_end_port: int = 10100
+    voice_rtp_echo_correlation: float = 0.70
+    voice_rtp_echo_window_ms: int = 1200
     
     voice_sample_rate: int = 8000  # 8kHz
     voice_frame_size: int = 320    # 20ms @ 8kHz, 16-bit PCM = 320 bayt
-    voice_agi_host: str = "127.0.0.1"
-    voice_agi_port: int = 4573
-    voice_audiosocket_host: str = "127.0.0.1"
-    voice_audiosocket_port: int = 9019
     voice_health_host: str = "127.0.0.1"
     voice_health_port: int = 9020
     voice_default_business_slug: str | None = None
@@ -42,28 +43,34 @@ class VoiceSettings(BaseSettings):
     voice_session_timeout_s: float = 300.0
     voice_log_level: str = "INFO"
     voice_metrics_retention_days: int = 30
-    voice_greeting_pcm: str = "app/voice/assets/greeting.slin"
+    voice_greeting_pcm: str = "app/voice/assets/greeting.wav"
+    voice_opening_pcm: str = "app/voice/assets/opening.wav"
+    voice_booking_success_pcm: str = "app/voice/assets/booking_success.wav"
 
     # Yerel ve ücretsiz ses işleme
     voice_vad_model: str = "app/voice/assets/models/silero_vad.onnx"
     voice_vad_start_probability: float = 0.50
-    voice_vad_barge_probability: float = 0.72
+    voice_vad_barge_probability: float = 0.60
     voice_vad_start_ms: int = 64
-    voice_vad_barge_ms: int = 96
-    voice_vad_end_silence_ms: int = 384
+    voice_vad_barge_ms: int = 128
+    voice_vad_end_silence_ms: int = 576
     voice_vad_preroll_ms: int = 256
-    voice_vad_energy_floor: float = 350.0
-    voice_vad_barge_energy_floor: float = 900.0
+    voice_vad_energy_floor: float = 250.0
+    voice_vad_barge_energy_floor: float = 450.0
     voice_vad_energy_multiplier: float = 3.0
     voice_vad_min_voiced_ms: int = 192
     voice_max_utterance_s: float = 12.0
-    # 8 kHz telefon sesinde base model özellikle tarih eklerini karıştırabiliyor.
-    # Small model hâlâ yerel/ücretsizdir ve kısa ifadelerde kabul edilebilir hızdadır.
+    # Üç çekirdekli canlı sunucuda large-v3-turbo kısa bir cümleyi 5-6 saniyede
+    # çözüyor. Yerel telefon örneklerinde Türkçe doğruluğu koruyan small model
+    # çağrı boyunca tek geçişte kullanılır.
     voice_stt_fast_model: str = "small"
-    # Small model hızlı ilk geçişi yapar; düşük güvenli telefon sesi daha güçlü
-    # modelle doğrulanır. Turbo, large-v3 doğruluğunu daha düşük gecikmeyle verir.
-    voice_stt_accurate_model: str = "large-v3-turbo"
+    voice_stt_accurate_model: str = "small"
     voice_stt_accurate_confidence_threshold: float = 0.60
+    voice_stt_context_retry_confidence: float = 0.45
+    voice_stt_min_actionable_confidence: float = 0.30
+    # Bu eşiğin altında hiçbir isim, hizmet, tarih, saat veya onay uygulanmaz.
+    voice_stt_absolute_min_confidence: float = 0.15
+    voice_max_pending_utterances: int = 4
     voice_stt_fast_workers: int = 2
     voice_stt_accurate_workers: int = 1
 

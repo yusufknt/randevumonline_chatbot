@@ -19,6 +19,9 @@ class TextToSpeechEngine:
 
     _client: httpx.AsyncClient | None = None
 
+    def __init__(self, request_read_timeout_s: float = 15.0) -> None:
+        self.request_read_timeout_s = request_read_timeout_s
+
     @classmethod
     async def startup(cls) -> None:
         if cls._client is None:
@@ -71,25 +74,34 @@ class TextToSpeechEngine:
     async def _voice_api_audio(
         self, text: str, settings: VoiceSettings
     ) -> AsyncIterator[bytes]:
-        await self.startup()
-        assert self._client is not None
         headers, cookies = self._auth(settings)
         url = f"{settings.tts_api_base_url.rstrip('/')}/createvoice/stream"
-        request = self._client.build_request(
-            "POST",
-            url,
-            headers=headers,
-            cookies=cookies,
-            json=self._payload(text, settings),
-        )
-        response = await self._client.send(request, stream=True)
-        try:
-            response.raise_for_status()
-            async for chunk in response.aiter_bytes(4096):
-                if chunk:
-                    yield chunk
-        finally:
-            await response.aclose()
+        # Her üretim kendi bağlantısını kullanır. İlk paket gelmeden iptal edilen
+        # bir barge-in isteği ortak keep-alive havuzunu kilitleyip sonraki bütün
+        # cevapları sessiz bırakabiliyordu.
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(
+                connect=5,
+                read=self.request_read_timeout_s,
+                write=10,
+                pool=5,
+            ),
+            limits=httpx.Limits(max_connections=1, max_keepalive_connections=1),
+            http2=False,
+        ) as client:
+            async with client.stream(
+                "POST",
+                url,
+                headers=headers,
+                cookies=cookies,
+                json=self._payload(text, settings),
+            ) as response:
+                response.raise_for_status()
+                # MP3 karelerini ffmpeg'e daha erken vererek ilk PCM paketinin
+                # kullanıcıya ulaşma süresini düşürür.
+                async for chunk in response.aiter_bytes(1024):
+                    if chunk:
+                        yield chunk
 
     @staticmethod
     async def _decode_mp3(source: AsyncIterable[bytes]) -> AsyncIterator[bytes]:
@@ -149,7 +161,9 @@ class TextToSpeechEngine:
         # Upstream bazen yalnızca ID3 başlığı gönderip chunked gövdeyi yarıda
         # kapatıyor. Farklı bir konuşmacı sesi kullanmak marka sesini bozduğu
         # için yalnızca yapılandırılmış ana sağlayıcıya istek yapılır.
-        for attempt in (1,):
+        # Sağlayıcı HTTP 200 ile boş/kesik stream döndürürse aynı konuşmacı ve
+        # aynı sağlayıcıyla bir kez daha dene; farklı bir sese geçme.
+        for attempt in (1, 2):
             emitted = 0
             try:
                 async for chunk in self._decode_mp3(
