@@ -103,6 +103,11 @@ async def create_appointment(
         start_utc = _parse_local(start_local, tz)
     except ValueError:
         return {"error": "invalid_start_time"}
+
+    now = datetime.now(timezone.utc)
+    if start_utc < now:
+        return {"error": "past_date"}
+
     duration = int(service["duration_minutes"])
     end_utc = start_utc + timedelta(minutes=duration)
 
@@ -134,7 +139,6 @@ async def create_appointment(
             return {"error": "no_free_room"}
         room_id = free["room_id"]
 
-    now = datetime.now(timezone.utc)
     appointment_id = ObjectId()
     guard_ids = await _reserve_guards(
         db, appointment_id, business["_id"], staff["_id"], start_utc, end_utc
@@ -284,7 +288,7 @@ async def reschedule_appointment(
         return {"error": "appointment_not_found"}
 
     tz = business.get("timezone", "Europe/Istanbul")
-    
+
     # Yeni zaman
     target_start_utc = apt["start_time"]
     if new_start_local:
@@ -292,10 +296,12 @@ async def reschedule_appointment(
             target_start_utc = _parse_local(new_start_local, tz)
         except ValueError:
             return {"error": "invalid_start_time"}
-            
+        if target_start_utc <= datetime.now(timezone.utc):
+            return {"error": "past_date"}
+
     # Yeni personel
     target_staff_id = new_staff["_id"] if new_staff else apt["staff_id"]
-    
+
     # Yeni hizmet
     service_doc = apt["services"][0]
     if new_service:
@@ -305,7 +311,7 @@ async def reschedule_appointment(
             "duration_minutes": int(new_service["duration_minutes"]),
             "price": _to_money_decimal128(new_service["price"]),
         }
-        
+
     duration = service_doc["duration_minutes"]
     target_end_utc = target_start_utc + timedelta(minutes=duration)
 

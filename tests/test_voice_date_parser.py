@@ -71,3 +71,17 @@ class TurkishVoiceDateParserTests(unittest.TestCase):
         self.assertEqual(yesterday, date(2026, 7, 22))
         self.assertEqual(day_before_yesterday, date(2026, 7, 21))
         self.assertEqual(label, "Evvelsi gün")
+
+    def test_past_calendar_day_is_not_silently_moved_to_next_year(self) -> None:
+        value, _ = parse_target_date_tr(
+            "22 Temmuz",
+            reference_date=date(2026, 7, 23),
+        )
+        self.assertEqual(value, date(2026, 7, 22))
+
+    def test_explicit_future_year_is_preserved(self) -> None:
+        value, _ = parse_target_date_tr(
+            "22 Temmuz 2027",
+            reference_date=date(2026, 7, 23),
+        )
+        self.assertEqual(value, date(2027, 7, 22))

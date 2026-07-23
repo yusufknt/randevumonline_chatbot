@@ -106,6 +106,14 @@ def _repair_time_stt(text: str) -> str:
 def _time_from_text(text: str, *, allow_bare: bool = False) -> str | None:
     if allow_bare:
         text = _repair_time_stt(text)
+    lower = text.casefold().replace("i\u0307", "i")
+    is_morning = "sabah" in lower
+
+    def normalize_hour(hour: int) -> int:
+        if 1 <= hour <= 7 and not is_morning:
+            return hour + 12
+        return hour
+
     m = re.search(r"\b([01]?\d|2[0-3])[:.]([0-5]\d)\b", text)
     if m:
         return f"{int(m.group(1)):02d}:{m.group(2)}"
@@ -114,17 +122,25 @@ def _time_from_text(text: str, *, allow_bare: bool = False) -> str | None:
         text.lower(),
     )
     if m:
-        hour = int(m.group(1))
-        if 1 <= hour <= 7:
-            hour += 12
+        hour = normalize_hour(int(m.group(1)))
         return f"{hour:02d}:{'30' if m.group(2) else '00'}"
     m = re.search(r"\b([01]?\d|2[0-3])['’]?(?:e|a|ye|ya)\b", text.lower())
     if m:
-        hour = int(m.group(1))
-        if 1 <= hour <= 7:
-            hour += 12
+        hour = normalize_hour(int(m.group(1)))
         return f"{hour:02d}:00"
     if allow_bare:
+        # Saat sorusuna verilen "16", "16 olsun", "akşam 7" ve
+        # "sabah 6" gibi kısa cevapları tekrar sordurmadan kabul et.
+        bare_numeric = re.fullmatch(
+            r"\s*(?:(?:sabah|öğlen|öğleden\s+sonra|akşam|ikindi|gece)\s+)?"
+            r"([01]?\d|2[0-3])"
+            r"(?:\s*['’]?(?:de|da|te|ta|e|a|ye|ya)|\s+(?:olsun|uygun))?"
+            r"\s*[.!]?\s*",
+            lower,
+        )
+        if bare_numeric:
+            return f"{normalize_hour(int(bare_numeric.group(1))):02d}:00"
+
         # Whisper, ekranda 16:30 görünen saati telefonda söylendiği biçimiyle
         # "on altı otuz" veya "dört buçuk" olarak yazabiliyor. Yalnız sistem
         # saat beklerken bu doğal cevapları kesin saate çevir.
@@ -151,10 +167,8 @@ def _time_from_text(text: str, *, allow_bare: bool = False) -> str | None:
             text.casefold(),
         )
         if spoken:
-            hour = spoken_hours[spoken.group(1)]
+            hour = normalize_hour(spoken_hours[spoken.group(1)])
             minute = spoken_minutes[spoken.group(2)]
-            if 1 <= hour <= 7:
-                hour += 12
             return f"{hour:02d}:{minute:02d}"
     hour_words = {
         "bir": 1, "iki": 2, "üç": 3, "dört": 4, "beş": 5, "altı": 6,
@@ -178,9 +192,7 @@ def _time_from_text(text: str, *, allow_bare: bool = False) -> str | None:
             text.lower(),
         )
     if m and m.group(1) in hour_words:
-        hour = hour_words[m.group(1)]
-        if 1 <= hour <= 7:
-            hour += 12
+        hour = normalize_hour(hour_words[m.group(1)])
         return f"{hour:02d}:00"
     return None
 
@@ -247,7 +259,7 @@ def _has_date(text: str) -> bool:
     if _invalid_explicit_date(text):
         return False
     words = (
-        "bugün", "yarın", "öbür gün", "pazartesi", "salı", "çarşamba",
+        "bugün", "yarın", "dün", "öbür gün", "pazartesi", "salı", "çarşamba",
         "perşembe", "cuma", "cumartesi", "pazar", "ocak", "şubat", "mart",
         "nisan", "mayıs", "haziran", "temmuz", "ağustos", "eylül", "ekim",
         "kasım", "aralık", "hafta",
@@ -717,8 +729,9 @@ class DialogManager:
             return (
                 "time",
                 "Beklenen saat: saat dokuz, saat on, saat on bir, saat on iki, "
-                "saat bir, saat iki, saat üç, saat dört, saat beş; ayrıca sabah, "
-                "öğleden sonra veya akşam.",
+                "saat on üç, saat on dört, saat on beş, saat on altı, "
+                "saat on yedi, saat on sekiz, saat on dokuz; buçuk, "
+                "sabah, öğleden sonra veya akşam ifadeleri de kullanılabilir.",
             )
         return (
             "general",
@@ -1486,6 +1499,41 @@ class DialogManager:
         self.pending = Pending(action, appointment)
         return self._confirmation_answer(action)
 
+    def _reject_past_selection(self, now: datetime | None = None) -> str | None:
+        """Geçmiş gün veya aynı gün geçmiş saat için onaya ilerlemeyi engelle."""
+        if not self.target_date:
+            return None
+        tz = ZoneInfo(self.business.get("timezone", "Europe/Istanbul"))
+        local_now = now.astimezone(tz) if now else datetime.now(tz)
+        if self.target_date < local_now.date():
+            self.target_date = None
+            self.target_time = None
+            if self.pending and self.pending.action in {
+                "create", "reschedule_collect", "reschedule_confirm",
+            }:
+                self.pending = None
+            return (
+                "Geçmiş bir tarihe randevu alamam. "
+                "Lütfen bugünden sonraki bir tarih söyler misiniz?"
+            )
+        if self.target_date == local_now.date() and self.target_time:
+            selected = datetime.combine(
+                self.target_date,
+                time.fromisoformat(self.target_time),
+                tzinfo=tz,
+            )
+            if selected <= local_now:
+                self.target_time = None
+                if self.pending and self.pending.action in {
+                    "create", "reschedule_confirm",
+                }:
+                    self.pending = None
+                return (
+                    "Bu saat geçmişte kaldı. "
+                    "Lütfen daha ileri bir saat söyler misiniz?"
+                )
+        return None
+
     def _fast_information_answer(self, text: str) -> str | None:
         lower = text.lower()
         if any(
@@ -1709,7 +1757,10 @@ class DialogManager:
             if _no(text):
                 self.pending = None
                 corrected = self._apply_confirmation_correction(text)
-                if corrected and all((
+                past_answer = self._reject_past_selection()
+                if past_answer:
+                    answer = past_answer
+                elif corrected and all((
                     self.staff_member,
                     self.service,
                     self.target_date,
@@ -1732,7 +1783,9 @@ class DialogManager:
             if mentioned_entity:
                 self.pending = None
                 self._apply_confirmation_correction(text)
-                answer = await self._prepare_confirmation("create")
+                answer = self._reject_past_selection()
+                if not answer:
+                    answer = await self._prepare_confirmation("create")
                 if any(x in lower for x in ("söyledim", "dedim", "diyorum")):
                     answer = "Haklısınız, söylediğiniz bilgiyi aldım. " + answer
                 await self._record("assistant", answer)
@@ -1885,6 +1938,10 @@ class DialogManager:
             answer = self._ambiguous_service_prompt(ambiguous_services)
             await self._record("assistant", answer)
             return answer
+        past_answer = self._reject_past_selection()
+        if past_answer:
+            await self._record("assistant", past_answer)
+            return past_answer
         if (
             self.staff_member
             and self.service
@@ -1951,6 +2008,9 @@ class DialogManager:
             self.clear_cache()
             self.target_time = None
             return "Bu saat az önce doldu. Başka bir saat seçer misiniz?"
+        if result.get("error") == "past_date":
+            self.target_time = None
+            return "Bu saat geçmişte kaldı. Lütfen daha ileri bir saat seçer misiniz?"
         if result.get("error"):
             return "Randevu kaydedilemedi. Lütfen tekrar deneyin."
         self.clear_cache()

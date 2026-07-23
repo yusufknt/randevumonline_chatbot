@@ -114,9 +114,7 @@ class VoiceLLMFastBookingTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_complete_sentence_books_without_second_llm_turn(self) -> None:
         engine = VoiceLLMEngine()
-        target_year = date.today().year + (
-            1 if (date.today().month, date.today().day) > (7, 18) else 0
-        )
+        target_year = date.today().year + 1
         fake_llm = FakeLLMClient(
             [
                 f"[RANDEVU: {target_year}-07-18 17:00 | Mehmet Kaya | "
@@ -127,7 +125,8 @@ class VoiceLLMFastBookingTests(unittest.IsolatedAsyncioTestCase):
 
         response = await collect_response(
             engine,
-            "18 Temmuz saat 17'de Mehmet Kaya'ya saç kesimi randevusu almak istiyorum.",
+            f"18 Temmuz {target_year} saat 17'de Mehmet Kaya'ya "
+            "saç kesimi randevusu almak istiyorum.",
         )
 
         self.assertIn("oluşturuldu", response)
@@ -146,9 +145,7 @@ class VoiceLLMFastBookingTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_time_is_remembered_while_only_missing_service_is_asked(self) -> None:
         engine = VoiceLLMEngine()
-        target_year = date.today().year + (
-            1 if (date.today().month, date.today().day) > (7, 18) else 0
-        )
+        target_year = date.today().year + 1
         fake_llm = FakeLLMClient(
             [
                 f"[RANDEVU: {target_year}-07-18 17:00 | Mehmet Kaya | "
@@ -159,7 +156,8 @@ class VoiceLLMFastBookingTests(unittest.IsolatedAsyncioTestCase):
 
         first_response = await collect_response(
             engine,
-            "18 Temmuz saat 17'de Mehmet Kaya'ya randevu almak istiyorum.",
+            f"18 Temmuz {target_year} saat 17'de Mehmet Kaya'ya "
+            "randevu almak istiyorum.",
         )
 
         self.assertIn("hangi işlemi", first_response.lower())

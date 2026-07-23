@@ -43,6 +43,7 @@ Sistem her turda "GÜNCEL OTURUM HAFIZASI" verebilir. Bu hafızadaki dolu alanla
    Bu etiketi gönderdiğinde sistem sana o günün boş saatlerini döndürecek.
 5. Usta, hizmet, gün ve saat hazır olduğunda ek onay veya müsait saat listesi istemeden KESİNLİKLE şu etiketi kullan:
    [RANDEVU: YYYY-MM-DD HH:MM | Usta Adı | Hizmet Adı | Müşteri Adı]
+   DİKKAT: Bu etiketi oluştururken müşteriye "Tamam randevunuzu oluşturdum" GİBİ KESİN SÖZLER SÖYLEME! Yalnızca etiketi üret, çünkü saat arka planda dolmuş olabilir. Sadece etiketi gönder, sistem sonucu müşteriye bildirecek.
 """
 
 def parse_target_date_tr(
@@ -76,14 +77,13 @@ def parse_target_date_tr(
         "temmuz": 7, "ağustos": 8, "eylül": 9, "ekim": 10, "kasım": 11, "aralık": 12
     }
     month_pattern = "|".join(months.keys())
-    exact_match = re.search(rf"(\d{{1,2}})\s*({month_pattern})", lower)
+    exact_match = re.search(
+        rf"(\d{{1,2}})\s*({month_pattern})(?:\s+(\d{{4}}))?", lower
+    )
     if exact_match:
         day = int(exact_match.group(1))
         month = months[exact_match.group(2)]
-        year = today.year
-        # Eğer geçmiş bir ay/gün söylenirse (örn. bugün 10 Ağustossa ve "5 Ağustos" denirse seneye at)
-        if month < today.month or (month == today.month and day < today.day):
-            year += 1
+        year = int(exact_match.group(3) or today.year)
         try:
             target_date = date(year, month, day)
             return target_date, f"{day} {exact_match.group(2).capitalize()}"
@@ -159,13 +159,16 @@ def parse_target_date_tr(
 
     weekdays = {
         "pazartesi": (0, "Pazartesi"), "salı": (1, "Salı"), "çarşamba": (2, "Çarşamba"),
-        "perşembe": (3, "Perşembe"), "cuma": (4, "Cuma"), "cumartesi": (5, "Cumartesi"),
+        "perşembe": (3, "Perşembe"), "cumartesi": (5, "Cumartesi"), "cuma": (4, "Cuma"),
         "pazar": (6, "Pazar")
     }
 
+    # Sort keys by length descending to match 'cumartesi' before 'cuma'
+    sorted_weekdays = sorted(weekdays.items(), key=lambda x: len(x[0]), reverse=True)
+
     current_monday = today - timedelta(days=today.weekday())
-    for tr_name, (target_wd, display_name) in weekdays.items():
-        if tr_name in lower:
+    for tr_name, (target_wd, display_name) in sorted_weekdays:
+        if re.search(rf"\b{tr_name}\b", lower):
             if weeks_to_add > 0:
                 target_date = current_monday + timedelta(
                     days=(weeks_to_add * 7) + target_wd
@@ -226,7 +229,7 @@ def format_available_slots(slots: list[str]) -> str:
     """Boş saatleri gruplayarak (örn. '09:00 ile 12:00 arası') daha doğal okunabilir metne çevirir."""
     if not slots:
         return "Maalesef dolu"
-        
+
     def to_mins(tstr: str) -> int:
         try:
             h, m = map(int, tstr.split(':'))
@@ -237,10 +240,10 @@ def format_available_slots(slots: list[str]) -> str:
     parsed = sorted((to_mins(s), s) for s in slots if ":" in s)
     if not parsed:
         return ", ".join(slots)
-    
+
     blocks = []
     current_block = [parsed[0]]
-    
+
     for i in range(1, len(parsed)):
         # 60 dakika veya daha az fark varsa bitişik say
         if parsed[i][0] - current_block[-1][0] <= 60:
@@ -249,7 +252,7 @@ def format_available_slots(slots: list[str]) -> str:
             blocks.append(current_block)
             current_block = [parsed[i]]
     blocks.append(current_block)
-    
+
     desc_parts = []
     for block in blocks:
         if len(block) >= 3:
@@ -259,15 +262,15 @@ def format_available_slots(slots: list[str]) -> str:
         else:
             for _, sstr in block:
                 desc_parts.append(sstr)
-                
+
     if not desc_parts:
         return "Maalesef dolu"
-        
+
     if len(desc_parts) == 1:
         if len(slots) >= 8 and "arası" in desc_parts[0]:
             return f"tüm gün {desc_parts[0]} müsait"
         return desc_parts[0]
-    
+
     return ", ".join(desc_parts[:-1]) + " ve " + desc_parts[-1]
 
 
@@ -302,7 +305,7 @@ class VoiceLLMEngine:
         self.session_start_time: float = time.time()
         self.turn_count: int = 0
         self.is_session_closed: bool = False
-        
+
         self._http_client: httpx.AsyncClient | None = None
 
     async def _get_client(self) -> httpx.AsyncClient:
@@ -389,7 +392,7 @@ class VoiceLLMEngine:
             "cumartesi", "pazar", "yarın", "bugün", "öbür gün",
             "ocak", "şubat", "mart", "nisan", "mayıs", "haziran",
             "temmuz", "ağustos", "eylül", "ekim", "kasım", "aralık",
-            "hafta",
+            "hafta", "gün"
         )
         if any(word in lower for word in date_words):
             return parse_target_date_tr(text)
@@ -398,6 +401,11 @@ class VoiceLLMEngine:
     @staticmethod
     def _extract_explicit_time(text: str) -> str | None:
         lower = VoiceLLMEngine._tr_lower(text)
+
+        # Check for PM indicators
+        is_pm = any(phrase in lower for phrase in ("öğleden sonra", "öğleden", "öğlen", "akşam", "ikindi", "gece"))
+        is_am = "sabah" in lower
+
         patterns = (
             r"\bsaat\s*(\d{1,2})(?:[:.](\d{2}))?\b",
             r"\b(\d{1,2})[:.](\d{2})\b",
@@ -410,6 +418,12 @@ class VoiceLLMEngine:
                 continue
             hour = int(match.group(1))
             minute = int(match.group(2) or 0) if match.lastindex and match.lastindex >= 2 else 0
+
+            # If hour is between 1 and 7, they almost certainly mean 13:00 to 19:00 for a salon,
+            # unless they explicitly said "sabah"
+            if (is_pm or (not is_am and 1 <= hour <= 7)) and hour < 12:
+                hour += 12
+
             if 0 <= hour <= 23 and 0 <= minute <= 59:
                 return f"{hour:02d}:{minute:02d}"
 
@@ -417,15 +431,31 @@ class VoiceLLMEngine:
             "dokuz": 9, "on": 10, "on bir": 11, "on iki": 12,
             "on üç": 13, "on dört": 14, "on beş": 15, "on altı": 16,
             "on yedi": 17, "on sekiz": 18, "on dokuz": 19,
-            "yirmi": 20,
+            "yirmi": 20, "bir": 1, "iki": 2, "üç": 3, "dört": 4, "beş": 5,
+            "altı": 6, "yedi": 7, "sekiz": 8
         }
+        words_pattern = "|".join(sorted(number_words.keys(), key=len, reverse=True))
         word_match = re.search(
-            r"\bsaat\s+(dokuz|on dokuz|on sekiz|on yedi|on altı|on beş|"
-            r"on dört|on üç|on iki|on bir|on|yirmi)\b",
+            rf"\bsaat\s+({words_pattern})\b",
             lower,
         )
         if word_match:
-            return f"{number_words[word_match.group(1)]:02d}:00"
+            hour = number_words[word_match.group(1)]
+            if (is_pm or (not is_am and 1 <= hour <= 7)) and hour < 12:
+                hour += 12
+            return f"{hour:02d}:00"
+
+        # Check if "öğleden sonra 2" without 'saat' prefix is used
+        if is_pm or is_am:
+            pm_match = re.search(r"(?:öğleden sonra|öğleden|öğlen|akşam|ikindi|gece|sabah)\s*(?:saat\s*)?(\d{1,2})(?:[:.](\d{2}))?", lower)
+            if pm_match:
+                hour = int(pm_match.group(1))
+                minute = int(pm_match.group(2) or 0) if pm_match.lastindex and pm_match.lastindex >= 2 else 0
+                if (is_pm or (not is_am and 1 <= hour <= 7)) and hour < 12:
+                    hour += 12
+                if 0 <= hour <= 23 and 0 <= minute <= 59:
+                    return f"{hour:02d}:{minute:02d}"
+
         return None
 
     def _remember_booking_details(self, user_text: str) -> None:
@@ -585,17 +615,17 @@ class VoiceLLMEngine:
             )
             self._db_services = list(db_services)
             self._db_staff = list(db_staff)
-            
+
             services_str = db_services_str if db_services_str else "Saç Kesimi, Sakal Tıraşı"
             staff_str = " veya ".join(db_staff) if db_staff else "Mehmet usta veya Yusuf usta"
             business_name = db_business.get("name", "RandevumOnline") if db_business else "RandevumOnline"
-            
+
             apts_strs = [f"ID: {a['id']} | Tarih: {a['date']} | Usta: {a['staff']} | Hizmet: {a['service']}" for a in user_apts]
             user_apts_str = "\n".join(apts_strs) if apts_strs else "Müşterinin aktif randevusu bulunmuyor."
-            
+
             from zoneinfo import ZoneInfo
             today_str = datetime.now(ZoneInfo("Europe/Istanbul")).strftime("%Y-%m-%d (%A)")
-            
+
             self.history[0]["content"] = self.history[0]["content"].format(
                 business_name=business_name,
                 staff_list=staff_str,
@@ -651,7 +681,7 @@ class VoiceLLMEngine:
                 {"role": "system", "content": self._booking_memory_context()},
                 self.history[-1],
             ]
-            
+
             # Stream isteği at
             async with client.stream(
                 "POST",
@@ -669,13 +699,13 @@ class VoiceLLMEngine:
                 },
             ) as resp:
                 resp.raise_for_status()
-                
+
                 import json
-                
+
                 buffer = ""
                 # Noktalama işaretlerine göre cümleleri ayırma
                 punctuation = set(".?!")
-                
+
                 async for line in resp.aiter_lines():
                     if not line or line.strip() == "":
                         continue
@@ -683,7 +713,7 @@ class VoiceLLMEngine:
                         line = line[6:]
                     if line == "[DONE]":
                         break
-                        
+
                     try:
                         data = json.loads(line)
                         if "choices" in data and len(data["choices"]) > 0:
@@ -692,7 +722,7 @@ class VoiceLLMEngine:
                             if content:
                                 buffer += content
                                 aggregated_assistant_text += content
-                                
+
                                 # Eğer tamponda noktalama işareti varsa veya belli bir uzunluğa ulaştıysa cümleyi yield et
                                 # Kontrol etiketleri [] içinde olduğu için '[' içeriyorsa yield etmeyi bekle
                                 if any(p in content for p in punctuation) and "[" not in buffer:
@@ -702,13 +732,13 @@ class VoiceLLMEngine:
                                     buffer = ""
                     except json.JSONDecodeError:
                         continue
-                        
+
                 # Kalan metni yield etmeden önce etiketleri ayrıştırmamız lazım!
                 assistant_text = aggregated_assistant_text.strip()
                 forced_response: str | None = None
-                    
+
                 import re
-                
+
                 # 1. KONTROL ETİKETİNİ YAKALA (Müsaitlik Sorgusu)
                 kontrol_match = re.search(r"\[KONTROL:\s*([^|]+)\|\s*([^|]+)(?:\|\s*([^\]]+))?\]", assistant_text)
                 if kontrol_match:
@@ -720,18 +750,18 @@ class VoiceLLMEngine:
                         and self.memory_service
                     ):
                         service_name = self.memory_service
-                    
+
                     logger.info("🔍 LLM Müsaitlik Sorgusu Tetikledi! Usta: %s, Tarih: %s, Hizmet: %s", staff_name, date_str, service_name)
-                    
+
                     # Gizli etiketi metinden çıkar
                     clean_text = assistant_text.replace(kontrol_match.group(0), "").strip()
                     if clean_text:
-                        # Kontrol sırasında asistan SUSMALI (müşteriye boş yere "kontrol ediyorum" denmemeli). 
+                        # Kontrol sırasında asistan SUSMALI (müşteriye boş yere "kontrol ediyorum" denmemeli).
                         # O yüzden bu metni sadece geçmişe ekliyoruz, sese (aggregated) vermiyoruz!
                         pass
-                        
+
                     self.history.append({"role": "assistant", "content": clean_text})
-                        
+
                     # Veritabanından saatleri çek
                     avail = await VoiceToolExecutor.check_availability(self.business_slug, service_name, date_str, staff_name)
                     if "error" in avail:
@@ -742,9 +772,9 @@ class VoiceLLMEngine:
                     else:
                         slots = format_available_slots(avail["available_slots"])
                         sys_msg = f"SİSTEM BİLGİSİ: {staff_name} için {date_str} tarihindeki boş saatler: {slots}. Randevu alımını hızlandırmak için bu müsait saatleri müşteriye doğrudan blok halinde söyle (Örn: '14 ile 17 arası boş, hangisini istersiniz?') ve seçmesini iste."
-                        
+
                     self.history.append({"role": "user", "content": sys_msg})
-                    
+
                     # 2. tur için recurse ol
                     async for chunk in self.generate_response(""):
                         yield chunk
@@ -757,9 +787,9 @@ class VoiceLLMEngine:
                     staff_name = match.group(2).strip()
                     service_name = match.group(3).strip()
                     customer_name = match.group(4).strip()
-                    
+
                     logger.info("📅 LLM Randevu Oluşturma Tetiklendi! Usta: %s, Hizmet: %s, Zaman: %s", staff_name, service_name, datetime_str)
-                    
+
                     result = await VoiceToolExecutor.book_appointment(
                         business_slug=self.business_slug,
                         service_name=service_name,
@@ -768,7 +798,7 @@ class VoiceLLMEngine:
                         customer_name=customer_name,
                         start_time_local=datetime_str,
                     )
-                    
+
                     if "error" in result:
                         err = result["error"]
                         logger.error("Randevu oluşturma hatası: %s", err)
@@ -821,7 +851,7 @@ class VoiceLLMEngine:
                 if iptal_match:
                     apt_id = iptal_match.group(1).strip()
                     logger.info("🗑️ LLM Randevu İptali Tetiklendi! ID: %s", apt_id)
-                    
+
                     success = await VoiceToolExecutor.cancel_appointment(apt_id)
                     if not success:
                         assistant_text = "Randevunuzu iptal edemedim. Lütfen tekrar deneyin veya müşteri temsilcisine bağlanın."
@@ -837,12 +867,12 @@ class VoiceLLMEngine:
                     new_date_str = revize_match.group(2).strip()
                     new_staff_name = revize_match.group(3).strip()
                     new_service_name = revize_match.group(4).strip()
-                    
+
                     logger.info("🔄 LLM Randevu Revizesi Tetiklendi! ID: %s, Yeni Zaman: %s, Usta: %s, Hizmet: %s", apt_id, new_date_str, new_staff_name, new_service_name)
-                    
+
                     result = await VoiceToolExecutor.reschedule_appointment(
-                        self.business_slug, 
-                        apt_id, 
+                        self.business_slug,
+                        apt_id,
                         new_date_str,
                         new_service_name,
                         new_staff_name
@@ -867,7 +897,7 @@ class VoiceLLMEngine:
                         self.memory_time = None
                         self.memory_service = None
                         self.memory_staff = None
-                    
+
                 # 5. [KAPAT] Etiketi kontrolü
                 if "[KAPAT]" in assistant_text:
                     logger.info("📞 LLM Çağrıyı Kapatma (KAPAT) komutu gönderdi.")
@@ -875,7 +905,7 @@ class VoiceLLMEngine:
                     assistant_text = assistant_text.replace("[KAPAT]", "").strip()
 
                 self.history.append({"role": "assistant", "content": assistant_text})
-                
+
                 # Eğer buffer'da kalan son metin varsa (noktalamasız bittiyse veya etiket temizlendikten sonra kaldıysa)
                 # Sadece etiket olmayan kısımları yield et
                 if forced_response:
@@ -902,7 +932,7 @@ class VoiceLLMEngine:
         # 1. Tarih algılama veya hafızadan hatırlama
         has_date_word = any(w in lower_text for w in [
             "pazartesi", "salı", "çarşamba", "perşembe", "cuma", "cumartesi", "pazar",
-            "yarın", "bugün", "öbür gün", "ocak", "şubat", "mart", "nisan", "mayıs", 
+            "yarın", "bugün", "öbür gün", "ocak", "şubat", "mart", "nisan", "mayıs",
             "haziran", "temmuz", "ağustos", "eylül", "ekim", "kasım", "aralık", "hafta"
         ])
         if has_date_word:
@@ -929,7 +959,7 @@ class VoiceLLMEngine:
             if first_name in lower_text:
                 self.memory_staff = staff
                 break
-                
+
         if self.memory_staff is None and any(w in lower_text for w in ["fark etmez", "her ikisi", "kim boşsa", "herhangi"]):
             self.memory_staff = db_staff[0] if db_staff else "Mehmet Kaya"
 
@@ -952,7 +982,7 @@ class VoiceLLMEngine:
         # ADIM 2: Usta seçildikten sonra müşteri hizmet/kategori söylemediyse VERİTABANINDAN kategorileri çekip sor!
         if self.memory_service is None:
             db_services = await VoiceToolExecutor.get_services(self.business_slug, self.memory_staff)
-            
+
             # Eğer müşteri genel bir ifade kullanmışsa filtrele
             filtered_services = []
             if "saç" in lower_text:
@@ -961,10 +991,10 @@ class VoiceLLMEngine:
                 filtered_services = [s for s in db_services if "sakal" in s.lower()]
             elif "bakım" in lower_text or "cilt" in lower_text or "maske" in lower_text:
                 filtered_services = [s for s in db_services if any(w in s.lower() for w in ["bakım", "maske", "cilt"])]
-            
+
             if filtered_services:
                 return f"{staff_short} için saç veya sakal gibi işlemlerimiz var. Hangi işlemi yaptırmak istersiniz?"
-            
+
             # Eğer müşteri hizmetlerin ne olduğunu soruyorsa sayalım
             if any(w in lower_text for w in ["hangi", "neler", "ne", "liste", "seçenek"]):
                 services_str = ", ".join(db_services) if db_services else "Saç Kesimi, Sakal Tıraşı"
@@ -977,7 +1007,7 @@ class VoiceLLMEngine:
             return f"Harika, {self.memory_service} randevunuzu oluşturmak için hangi gün ve saat gelmek istersiniz? Örneğin: yarın saat 14:00, veya 15 temmuz diyebilirsiniz."
 
         target_date = self.memory_date
-        
+
         # Ekstra Güvenlik: Eğer seçilen tarih geçmişte kalmışsa (bugünden önceyse) uyarı ver
         from datetime import date
         if target_date < date.today():
@@ -999,7 +1029,7 @@ class VoiceLLMEngine:
                 staff_name=self.memory_staff,
             )
             slots = avail.get("available_slots", [])
-            
+
             if not slots:
                 return f"Maalesef {day_label} günü için {staff_short} hiç müsait saatimiz kalmamış. Farklı bir gün tercih eder misiniz?"
 

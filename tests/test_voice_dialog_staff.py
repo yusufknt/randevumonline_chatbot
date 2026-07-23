@@ -93,6 +93,10 @@ class VoiceDialogStaffTests(unittest.IsolatedAsyncioTestCase):
             _time_from_text("Dört buçuk olsun.", allow_bare=True),
             "16:30",
         )
+        self.assertEqual(_time_from_text("16", allow_bare=True), "16:00")
+        self.assertEqual(_time_from_text("16 olsun", allow_bare=True), "16:00")
+        self.assertEqual(_time_from_text("Akşam 7", allow_bare=True), "19:00")
+        self.assertEqual(_time_from_text("Sabah 6", allow_bare=True), "06:00")
         self.assertIsNone(_time_from_text("Bir randevu istiyorum"))
         self.assertIsNone(_time_from_text("Saat 28"))
         self.assertIsNone(_time_from_text("Saat 24"))
@@ -138,6 +142,30 @@ class VoiceDialogStaffTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.dialog.target_time)
         self.assertIsNone(self.dialog.pending)
         self.assertIn("saat geçerli değil", answer)
+
+    async def test_past_date_is_rejected_before_availability_or_confirmation(self) -> None:
+        self.dialog.staff_member = self.dialog.staff[0]
+        self.dialog.service = self.dialog.services[0]
+
+        answer = await self.dialog.respond("Dün saat 17")
+
+        self.assertIsNone(self.dialog.target_date)
+        self.assertIsNone(self.dialog.target_time)
+        self.assertIn("Geçmiş bir tarihe", answer)
+        self.dialog._requested_slot_status.assert_not_awaited()
+
+    async def test_past_time_today_is_rejected_before_confirmation(self) -> None:
+        self.dialog.business["timezone"] = "Europe/Istanbul"
+        self.dialog.staff_member = self.dialog.staff[0]
+        self.dialog.service = self.dialog.services[0]
+        now = datetime(2026, 7, 23, 15, 30, tzinfo=ZoneInfo("Europe/Istanbul"))
+        self.dialog.target_date = now.date()
+        self.dialog.target_time = "15:00"
+
+        answer = self.dialog._reject_past_selection(now)
+
+        self.assertIsNone(self.dialog.target_time)
+        self.assertIn("saat geçmişte kaldı", answer)
 
     def test_stt_prompt_only_contains_terms_expected_in_current_turn(self) -> None:
         state, prompt = self.dialog.stt_context()
