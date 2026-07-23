@@ -55,6 +55,21 @@ def parse_target_date_tr(
     today = reference_date or date.today()
     lower = text.replace("İ", "i").replace("I", "ı").lower()
 
+    number_words = {
+        "bir": 1, "iki": 2, "üç": 3, "dört": 4, "beş": 5,
+        "altı": 6, "yedi": 7, "sekiz": 8, "dokuz": 9, "on": 10,
+        "on bir": 11, "on iki": 12, "on üç": 13, "on dört": 14,
+        "on beş": 15, "on altı": 16, "on yedi": 17, "on sekiz": 18,
+        "on dokuz": 19, "yirmi": 20, "yirmi bir": 21,
+        "yirmi iki": 22, "yirmi üç": 23, "yirmi dört": 24,
+        "yirmi beş": 25, "yirmi altı": 26, "yirmi yedi": 27,
+        "yirmi sekiz": 28, "yirmi dokuz": 29, "otuz": 30,
+        "otuz bir": 31,
+    }
+    spoken_numbers = "|".join(
+        sorted((re.escape(word) for word in number_words), key=len, reverse=True)
+    )
+
     # 1. Tam Tarihler (Örn: 15 temmuz)
     months = {
         "ocak": 1, "şubat": 2, "mart": 3, "nisan": 4, "mayıs": 5, "haziran": 6,
@@ -75,15 +90,33 @@ def parse_target_date_tr(
         except ValueError:
             pass
 
-    # 2. Doğrudan göreli günler
-    if "bugün" in lower:
-        return today, "Bugün"
-    if "öbür gün" in lower:
-        return today + timedelta(days=2), "Öbür gün"
-    if "yarın" in lower:
-        return today + timedelta(days=1), "Yarın"
+    # 2. Sayıyla veya yazıyla belirtilen göreli günler.
+    day_offset = re.search(
+        rf"\b(\d{{1,3}}|{spoken_numbers})\s+gün\s+(sonra|önce)\b",
+        lower,
+    )
+    if day_offset:
+        raw_value = day_offset.group(1)
+        days = int(raw_value) if raw_value.isdigit() else number_words[raw_value]
+        direction = 1 if day_offset.group(2) == "sonra" else -1
+        target_date = today + timedelta(days=days * direction)
+        label = (
+            f"{days} gün sonra"
+            if direction > 0
+            else f"{days} gün önce"
+        )
+        return target_date, label
 
-    # 3. Takvim haftası ifadeleri
+    if any(
+        phrase in lower
+        for phrase in ("evvelsi gün", "evveli gün", "dünden evvel")
+    ):
+        return today - timedelta(days=2), "Evvelsi gün"
+    if any(phrase in lower for phrase in ("dün", "önceki gün")):
+        return today - timedelta(days=1), "Dün"
+
+    # 3. Takvim haftası ifadeleri. Bu bölüm doğrudan "bugün" kontrolünden
+    # önce çalışmalı; aksi halde "haftaya bugün" yanlışlıkla bugün olur.
     next_week = any(
         phrase in lower
         for phrase in ("haftaya", "gelecek hafta", "önümüzdeki hafta")
@@ -95,6 +128,34 @@ def parse_target_date_tr(
         week_numbers = {"bir": 1, "iki": 2, "üç": 3, "dört": 4, "beş": 5}
         val = week_match.group(1)
         weeks_to_add = int(val) if val.isdigit() else week_numbers[val]
+
+    if weeks_to_add > 0:
+        relative_days = None
+        relative_label = ""
+        if "öbür gün" in lower:
+            relative_days, relative_label = 2, "öbür gün"
+        elif "yarın" in lower or "ertesi gün" in lower:
+            relative_days, relative_label = 1, "yarın"
+        elif "bugün" in lower:
+            relative_days, relative_label = 0, "bugün"
+        if relative_days is not None:
+            target_date = today + timedelta(
+                days=(weeks_to_add * 7) + relative_days
+            )
+            week_label = (
+                "Haftaya"
+                if next_week and not week_match
+                else f"{weeks_to_add} hafta sonra"
+            )
+            return target_date, f"{week_label} {relative_label}"
+
+    # 4. Doğrudan göreli günler
+    if "bugün" in lower:
+        return today, "Bugün"
+    if "öbür gün" in lower:
+        return today + timedelta(days=2), "Öbür gün"
+    if "yarın" in lower or "ertesi gün" in lower:
+        return today + timedelta(days=1), "Yarın"
 
     weekdays = {
         "pazartesi": (0, "Pazartesi"), "salı": (1, "Salı"), "çarşamba": (2, "Çarşamba"),

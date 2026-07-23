@@ -55,8 +55,8 @@ class VoiceSettings(BaseSettings):
     voice_vad_barge_ms: int = 128
     voice_vad_end_silence_ms: int = 576
     voice_vad_preroll_ms: int = 256
-    voice_vad_energy_floor: float = 250.0
-    voice_vad_barge_energy_floor: float = 450.0
+    voice_vad_energy_floor: float = 550.0
+    voice_vad_barge_energy_floor: float = 1050.0
     voice_vad_energy_multiplier: float = 3.0
     voice_vad_min_voiced_ms: int = 192
     voice_max_utterance_s: float = 12.0

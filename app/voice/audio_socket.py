@@ -9,6 +9,7 @@ import time
 import uuid
 import wave
 from collections import deque
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -30,6 +31,21 @@ CALLS = Counter("voice_calls_total", "Telefon çağrıları", ["result"])
 STT_SECONDS = Histogram("voice_stt_seconds", "Yerel STT süresi", buckets=(.2, .4, .7, 1, 1.5, 3, 6))
 TURN_SECONDS = Histogram("voice_turn_seconds", "Söz sonundan ilk ses paketine süre", buckets=(.5, 1, 1.5, 2, 3, 5, 10))
 BARGE_INS = Counter("voice_barge_ins_total", "Kullanıcının asistan sözünü kesmesi")
+
+
+@dataclass(slots=True)
+class _QueuedUtterance:
+    pcm: bytes
+    generation: int
+    interrupted: bool = False
+
+
+@dataclass(slots=True)
+class _QueuedSpeech:
+    text: str
+    turn_started: float
+    generation: int
+    booking_success: bool = False
 
 
 def encode_frame(packet_type: int, payload: bytes = b"") -> bytes:
@@ -78,6 +94,18 @@ class AudioSocketCall:
         self.turn_pcm = bytearray()
         self.pending_utterances: deque[bytes] = deque()
         self.turn_revision = 0
+        # Çağrı başına coroutine-safe kuyruklar. RTP okuma, STT/LLM ve TTS
+        # birbirini bloklamaz; eski generation hiçbir zaman yeni sese karışmaz.
+        self.audio_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=200)
+        self.llm_queue: asyncio.Queue[_QueuedUtterance] = asyncio.Queue(maxsize=4)
+        self.tts_queue: asyncio.Queue[_QueuedSpeech] = asyncio.Queue(maxsize=4)
+        self.workers: list[asyncio.Task] = []
+        self.queue_mode = False
+        self.stream_generation = 0
+        self.current_turn_generation = 0
+        self.current_speech_interrupted = False
+        self.llm_cancel_event: asyncio.Event | None = None
+        self.turn_stage = "idle"
         self.started = time.monotonic()
         self.first_audio_at: float | None = None
         self.frames_in = 0
@@ -85,7 +113,7 @@ class AudioSocketCall:
         self.result = "completed"
         self.business_id = None
         self.terminating = False
-        self.phase = self.LOCKED_INTRO
+        self.phase = self.INTERRUPTIBLE_DIALOG
 
     async def run(self) -> None:
         context = await registry.wait(self.uuid)
@@ -98,10 +126,15 @@ class AudioSocketCall:
         self.dialog = DialogManager(business, context.caller, self.uuid)
         await self.dialog.initialize()
         ACTIVE_CALLS.inc()
-        # Karşılama sabit bir anons olduğu için normal TTS barge-in akışından
-        # ayrılır. Bayrağı task başlamadan etkinleştirerek ilk ses paketindeki yarışı
-        # da önlüyoruz.
-        self.phase = self.LOCKED_INTRO
+        self.queue_mode = True
+        self.workers = [
+            asyncio.create_task(self._audio_worker(), name=f"voice-audio-{self.uuid}"),
+            asyncio.create_task(self._turn_worker(), name=f"voice-llm-{self.uuid}"),
+            asyncio.create_task(self._tts_worker(), name=f"voice-tts-{self.uuid}"),
+        ]
+        # Karşılama dahil tüm diyalog sesleri insan konuşmasıyla kesilebilir.
+        # Bayrağı playback task'ından önce açarak ilk ses paketindeki yarışı önle.
+        self.phase = self.INTERRUPTIBLE_DIALOG
         self._start_playback(self._play_opening())
         try:
             while True:
@@ -120,30 +153,160 @@ class AudioSocketCall:
                     self.dialog and self.dialog.closed
                 ):
                     continue
-                # İlk karşılama kesilemez. Bu sırada gelen çağrı sesi daha sonra
-                # yanlışlıkla bir seçimmiş gibi işlenmesin diye VAD'a verilmez.
-                if self.phase == self.LOCKED_INTRO:
-                    continue
-                barge, utterances = self.segmenter.feed(
-                    payload, bool(self.playback and not self.playback.done())
-                )
-                if barge:
-                    BARGE_INS.inc()
-                    log.info(
-                        "Araya giriş doğrulandı uuid=%s vad=%.2f rms=%.0f noise=%.0f",
-                        self.uuid,
-                        self.segmenter.last_probability,
-                        self.segmenter.last_rms,
-                        self.segmenter.noise_floor,
-                    )
-                    await self._cancel_playback()
-                if utterances:
-                    for utterance in utterances:
-                        self._queue_utterance(utterance)
+                if self.audio_queue.full():
+                    # Gecikmeyi büyütmek yerine en eski 20 ms kareyi bırak.
+                    # Normal çalışmada bu kuyruk dolmaz; yalnız event-loop uzun
+                    # süre bloke olursa çağrının gerisinden sürüklenmeyi önler.
+                    with contextlib.suppress(asyncio.QueueEmpty):
+                        self.audio_queue.get_nowait()
+                self.audio_queue.put_nowait(payload)
         except asyncio.IncompleteReadError:
             pass
         finally:
             await self.close()
+
+    def _response_active(self) -> bool:
+        return bool(
+            (self.playback and not self.playback.done())
+            or (self.current_turn and not self.current_turn.done())
+            or not self.tts_queue.empty()
+        )
+
+    async def _audio_worker(self) -> None:
+        while True:
+            payload = await self.audio_queue.get()
+            assistant_speaking = bool(self.playback and not self.playback.done())
+            barge, utterances = self.segmenter.feed(payload, assistant_speaking)
+            interrupted_on_start = False
+
+            if self.segmenter.speech_started:
+                interrupted = self._response_active()
+                self.current_speech_interrupted = interrupted
+                self.stream_generation += 1
+                log.info(
+                    "Voice detected uuid=%s generation=%d vad=%.2f rms=%.0f "
+                    "ac_rms=%.0f zcr=%.2f",
+                    self.uuid,
+                    self.stream_generation,
+                    self.segmenter.last_probability,
+                    self.segmenter.last_rms,
+                    getattr(self.segmenter, "last_ac_rms", 0.0),
+                    getattr(self.segmenter, "last_zero_crossing_rate", 0.0),
+                )
+                log.info(
+                    "Streaming STT started uuid=%s generation=%d",
+                    self.uuid,
+                    self.stream_generation,
+                )
+                if interrupted:
+                    await self._interrupt_response()
+                    interrupted_on_start = True
+
+            # Bot, kullanıcı konuşmaya başladıktan sonra TTS'e geçmiş olabilir.
+            # Bu durumda VAD başlangıç anında assistant_speaking=False idi; seviye
+            # kontrolü eski cevabın kullanıcının üzerine binmesini engeller.
+            if not interrupted_on_start:
+                if (
+                    self.segmenter.speaking
+                    and self.playback
+                    and not self.playback.done()
+                    and not self.terminating
+                ):
+                    await self._interrupt_response()
+                elif barge:
+                    await self._interrupt_response()
+
+            for utterance in utterances:
+                self._queue_utterance(
+                    utterance,
+                    self.stream_generation,
+                    interrupted=self.current_speech_interrupted,
+                )
+                self.current_speech_interrupted = False
+
+    async def _interrupt_response(self) -> None:
+        interrupt_started = time.monotonic()
+        BARGE_INS.inc()
+        log.info(
+            "Interrupt detected uuid=%s generation=%d vad=%.2f rms=%.0f "
+            "ac_rms=%.0f zcr=%.2f noise=%.0f",
+            self.uuid,
+            self.stream_generation,
+            self.segmenter.last_probability,
+            self.segmenter.last_rms,
+            getattr(self.segmenter, "last_ac_rms", 0.0),
+            getattr(self.segmenter, "last_zero_crossing_rate", 0.0),
+            self.segmenter.noise_floor,
+        )
+        if self.llm_cancel_event and not self.llm_cancel_event.is_set():
+            log.info(
+                "Canceling LLM uuid=%s generation=%d",
+                self.uuid,
+                self.current_turn_generation,
+            )
+            self.llm_cancel_event.set()
+        while not self.tts_queue.empty():
+            with contextlib.suppress(asyncio.QueueEmpty):
+                self.tts_queue.get_nowait()
+        if self.playback and not self.playback.done():
+            log.info(
+                "Stopping TTS uuid=%s generation=%d",
+                self.uuid,
+                self.current_turn_generation,
+            )
+            await self._cancel_playback()
+        log.info(
+            "Restarting conversation uuid=%s generation=%d stop_ms=%d",
+            self.uuid,
+            self.stream_generation,
+            round((time.monotonic() - interrupt_started) * 1000),
+        )
+
+    async def _turn_worker(self) -> None:
+        while True:
+            item = await self.llm_queue.get()
+            if item.generation != self.stream_generation:
+                continue
+            self.current_turn_generation = item.generation
+            self.llm_cancel_event = asyncio.Event()
+            self.current_turn = asyncio.create_task(
+                self._process_turn(
+                    item.pcm,
+                    generation=item.generation,
+                    cancel_event=self.llm_cancel_event,
+                    interrupted=item.interrupted,
+                )
+            )
+            try:
+                await self.current_turn
+            except asyncio.CancelledError:
+                if self.phase == self.TERMINATING:
+                    raise
+            finally:
+                self.current_turn = None
+                self.llm_cancel_event = None
+                self.turn_stage = "idle"
+
+    async def _tts_worker(self) -> None:
+        while True:
+            item = await self.tts_queue.get()
+            if item.generation != self.stream_generation or self.segmenter.speaking:
+                continue
+            log.info(
+                "New stream created uuid=%s generation=%d",
+                self.uuid,
+                item.generation,
+            )
+            awaitable = (
+                self._play_booking_success()
+                if item.booking_success
+                else self._speak(item.text, item.turn_started, item.generation)
+            )
+            self._start_playback(awaitable)
+            task = self.playback
+            if task:
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
 
     async def _cancel_playback(self) -> None:
         if self.playback and not self.playback.done():
@@ -200,8 +363,30 @@ class AudioSocketCall:
         )
         self._start_turn(pcm)
 
-    def _queue_utterance(self, utterance: bytes) -> None:
+    def _queue_utterance(
+        self,
+        utterance: bytes,
+        generation: int | None = None,
+        *,
+        interrupted: bool = False,
+    ) -> None:
         """STT sürerken gelen ifadeyi mevcut sesi bozmayacak ayrı turda tutar."""
+        if self.queue_mode:
+            item = _QueuedUtterance(
+                bytes(utterance),
+                self.stream_generation if generation is None else generation,
+                interrupted,
+            )
+            if self.llm_queue.full():
+                with contextlib.suppress(asyncio.QueueEmpty):
+                    dropped = self.llm_queue.get_nowait()
+                    log.info(
+                        "Eski LLM queue öğesi düşürüldü uuid=%s generation=%d",
+                        self.uuid,
+                        dropped.generation,
+                    )
+            self.llm_queue.put_nowait(item)
+            return
         active = bool(self.current_turn and not self.current_turn.done())
         if active or self.pending_utterances:
             # Her tamamlanan ifade kendi sırasını korur. Böylece kullanıcı
@@ -353,12 +538,52 @@ class AudioSocketCall:
                 )
             return audio.readframes(audio.getnframes())
 
-    async def _process_turn(self, pcm: bytes) -> None:
+    def _generation_is_current(self, generation: int | None) -> bool:
+        return generation is None or generation == self.stream_generation
+
+    async def _schedule_speech(
+        self,
+        text: str,
+        turn_started: float,
+        generation: int | None,
+        *,
+        booking_success: bool = False,
+    ) -> None:
+        if not self._generation_is_current(generation):
+            return
+        if not self.queue_mode:
+            self._start_playback(
+                self._play_booking_success()
+                if booking_success
+                else self._speak(text, turn_started)
+            )
+            return
+        item = _QueuedSpeech(
+            text=text,
+            turn_started=turn_started,
+            generation=self.stream_generation if generation is None else generation,
+            booking_success=booking_success,
+        )
+        if self.tts_queue.full():
+            with contextlib.suppress(asyncio.QueueEmpty):
+                self.tts_queue.get_nowait()
+        self.tts_queue.put_nowait(item)
+
+    async def _process_turn(
+        self,
+        pcm: bytes,
+        generation: int | None = None,
+        cancel_event: asyncio.Event | None = None,
+        interrupted: bool = False,
+    ) -> None:
         started = time.monotonic()
         assert self.dialog is not None
         expected_state, domain_prompt = self.dialog.stt_context()
+        self.turn_stage = "stt"
         with STT_SECONDS.time():
             transcript = await self.stt.transcribe(pcm, domain_prompt=domain_prompt)
+        if not self._generation_is_current(generation):
+            return
         cfg = get_voice_settings()
         if (
             transcript.confidence < cfg.voice_stt_context_retry_confidence
@@ -370,6 +595,8 @@ class AudioSocketCall:
                 domain_prompt=domain_prompt,
                 contextual=True,
             )
+            if not self._generation_is_current(generation):
+                return
             selected = choose_transcript(transcript, contextual, domain_prompt)
             log.info(
                 "STT bağlamsal ikinci geçiş uuid=%s state=%s "
@@ -385,7 +612,11 @@ class AudioSocketCall:
             transcript = selected
         if not transcript.text:
             self.turn_pcm.clear()
-            answer = self.dialog.low_confidence_retry_prompt()
+            answer = (
+                self.dialog.interruption_retry_prompt()
+                if interrupted
+                else self.dialog.low_confidence_retry_prompt()
+            )
             log.info(
                 "STT boş sonuç; durum korunarak tekrar soruluyor uuid=%s state=%s",
                 self.uuid,
@@ -400,7 +631,7 @@ class AudioSocketCall:
                 )
                 return
             await self._cancel_playback()
-            self._start_playback(self._speak(answer, started))
+            await self._schedule_speech(answer, started, generation)
             return
         # Aynı modeli aynı ayarlarla ikinci kez çalıştırmak yalnızca gecikmeyi
         # artırır. Doğrulama modeli gerçekten farklıysa düşük güveni doğrula.
@@ -419,6 +650,8 @@ class AudioSocketCall:
             accurate = await self.stt.transcribe(
                 pcm, accurate=True, domain_prompt=domain_prompt
             )
+            if not self._generation_is_current(generation):
+                return
             selected = choose_transcript(transcript, accurate, domain_prompt)
             log.info(
                 "STT aday seçimi uuid=%s fast=%s/%.2f accurate=%s/%.2f "
@@ -451,7 +684,11 @@ class AudioSocketCall:
             and not expected_entity_recognized
         ):
             self.turn_pcm.clear()
-            answer = self.dialog.low_confidence_retry_prompt()
+            answer = (
+                self.dialog.interruption_retry_prompt()
+                if interrupted
+                else self.dialog.low_confidence_retry_prompt()
+            )
             log.info(
                 "Mutlak düşük güvenli STT reddedildi uuid=%s state=%s "
                 "confidence=%.2f text=%s",
@@ -468,14 +705,18 @@ class AudioSocketCall:
                 )
                 return
             await self._cancel_playback()
-            self._start_playback(self._speak(answer, started))
+            await self._schedule_speech(answer, started, generation)
             return
         if (
             transcript.confidence < cfg.voice_stt_min_actionable_confidence
             and not expected_entity_recognized
         ):
             self.turn_pcm.clear()
-            answer = self.dialog.low_confidence_retry_prompt()
+            answer = (
+                self.dialog.interruption_retry_prompt()
+                if interrupted
+                else self.dialog.low_confidence_retry_prompt()
+            )
             log.info(
                 "Düşük güvenli STT reddedildi uuid=%s state=%s confidence=%.2f "
                 "text=%s",
@@ -493,7 +734,7 @@ class AudioSocketCall:
                     len(self.pending_utterances),
                 )
                 return
-            self._start_playback(self._speak(answer, started))
+            await self._schedule_speech(answer, started, generation)
             return
         if (
             transcript.confidence < cfg.voice_stt_min_actionable_confidence
@@ -520,6 +761,11 @@ class AudioSocketCall:
             len(transcript.text),
             round((stt_done - started) * 1000),
         )
+        log.info(
+            "Streaming STT finished uuid=%s generation=%d",
+            self.uuid,
+            self.stream_generation if generation is None else generation,
+        )
         if normalized_transcript != raw_transcript:
             log.info(
                 "STT bağlamsal düzeltme uuid=%s state=%s raw=%s normalized=%s",
@@ -534,7 +780,28 @@ class AudioSocketCall:
             self.uuid,
             safe_transcript,
         )
-        answer = await self.dialog.respond(normalized_transcript)
+        self.turn_stage = "llm"
+        try:
+            answer = await self.dialog.respond(
+                normalized_transcript,
+                cancel_event=cancel_event,
+            )
+        except asyncio.CancelledError:
+            log.info(
+                "LLM response canceled uuid=%s generation=%d",
+                self.uuid,
+                self.stream_generation if generation is None else generation,
+            )
+            return
+        if not self._generation_is_current(generation):
+            log.info(
+                "Eski cevap generation nedeniyle atıldı uuid=%s "
+                "generation=%d current=%d",
+                self.uuid,
+                self.stream_generation if generation is None else generation,
+                self.stream_generation,
+            )
+            return
         if self.dialog.closed:
             self.terminating = True
             self.phase = self.TERMINATING
@@ -562,16 +829,27 @@ class AudioSocketCall:
             )
             return
         if getattr(self.dialog, "completion_kind", None) == "booking_success":
-            self._start_playback(self._play_booking_success())
+            await self._schedule_speech(
+                answer, started, generation, booking_success=True
+            )
         else:
-            self._start_playback(self._speak(answer, started))
+            await self._schedule_speech(answer, started, generation)
 
-    async def _speak(self, text: str, turn_started: float) -> None:
+    async def _speak(
+        self, text: str, turn_started: float, generation: int | None = None
+    ) -> None:
         tts = TextToSpeechEngine()
         first = True
         chunks_sent = 0
+        log.info(
+            "Streaming TTS started uuid=%s generation=%d",
+            self.uuid,
+            self.stream_generation if generation is None else generation,
+        )
         try:
             async for chunk in tts.synthesize_stream(text):
+                if not self._generation_is_current(generation):
+                    raise asyncio.CancelledError
                 if first:
                     TURN_SECONDS.observe(time.monotonic() - turn_started)
                     log.info(
@@ -585,8 +863,9 @@ class AudioSocketCall:
                 await asyncio.sleep(.02)
         except asyncio.CancelledError:
             log.info(
-                "TTS stream kullanıcı konuşmasıyla kesildi uuid=%s chunks=%d",
+                "Streaming TTS stopped uuid=%s generation=%d chunks=%d",
                 self.uuid,
+                self.stream_generation if generation is None else generation,
                 chunks_sent,
             )
             raise
@@ -607,6 +886,11 @@ class AudioSocketCall:
                 self.uuid,
                 chunks_sent,
                 chunks_sent * 20,
+            )
+            log.info(
+                "Streaming TTS stopped uuid=%s generation=%d reason=completed",
+                self.uuid,
+                self.stream_generation if generation is None else generation,
             )
         if self.dialog and self.dialog.closed:
             await self._finish_assistant_hangup()
@@ -663,11 +947,24 @@ class AudioSocketCall:
         # İptal edilen STT görevinin callback'i bekleyen FIFO turunu yeniden
         # başlatmasın; çağrı kapanırken artık hiçbir yeni iş kabul edilmez.
         self.phase = self.TERMINATING
+        if self.llm_cancel_event:
+            self.llm_cancel_event.set()
         await self._cancel_playback()
         if self.current_turn and not self.current_turn.done():
             self.current_turn.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self.current_turn
+        current_task = asyncio.current_task()
+        for worker in self.workers:
+            if worker is not current_task and not worker.done():
+                worker.cancel()
+        if self.workers:
+            await asyncio.gather(
+                *(worker for worker in self.workers if worker is not current_task),
+                return_exceptions=True,
+            )
+        self.workers.clear()
+        self.queue_mode = False
         self.pending_utterances.clear()
         await registry.remove(self.uuid)
         if self.dialog:

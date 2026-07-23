@@ -66,11 +66,20 @@ class UtteranceSegmenter:
         self.total_voice_frames = 0
         self.silence_frames = 0
         self.speaking = False
+        self.speech_started = False
+        self.speech_finished = False
         self.last_probability = 0.0
         self.last_rms = 0.0
+        self.last_ac_rms = 0.0
+        self.last_zero_crossing_rate = 0.0
 
     def feed(self, data: bytes, assistant_speaking: bool = False) -> tuple[bool, list[bytes]]:
         """(barge_in, tamamlanan_ifadeler) döndürür."""
+        # Her feed çağrısı için edge-triggered olaylar. ``speaking`` seviye
+        # bilgisidir; bunlar ise session coordinator'ın yalnız bir kez interrupt
+        # üretmesini sağlar.
+        self.speech_started = False
+        self.speech_finished = False
         self.pending.extend(data)
         completed: list[bytes] = []
         barge = False
@@ -80,8 +89,15 @@ class UtteranceSegmenter:
             probability = self.vad.probability(frame)
             samples = np.frombuffer(frame, dtype="<i2").astype(np.float32)
             rms = float(np.sqrt(np.mean(samples * samples)))
+            centered = samples - float(np.mean(samples))
+            ac_rms = float(np.sqrt(np.mean(centered * centered)))
+            zero_crossing_rate = float(
+                np.mean(np.signbit(centered[1:]) != np.signbit(centered[:-1]))
+            )
             self.last_probability = probability
             self.last_rms = rms
+            self.last_ac_rms = ac_rms
+            self.last_zero_crossing_rate = zero_crossing_rate
             threshold = self.barge_probability if assistant_speaking else self.start_probability
             energy_threshold = max(
                 self.barge_energy_floor if assistant_speaking else self.energy_floor,
@@ -90,13 +106,34 @@ class UtteranceSegmenter:
             )
             if assistant_speaking:
                 # AI konuşurken çevre sesi stream'i kesmesin: hem konuşma hem
-                # yakınlık ve süre şartı birlikte aranır.
-                voiced = probability >= threshold and rms >= energy_threshold
+                # yakınlık ve süre şartı birlikte aranır. 8 kHz telefon hattında
+                # Silero bazı güçlü gerçek konuşmaları 0.00 olasılıkla kaçırıyor.
+                # RTP korelasyon filtresinden geçen, DC/tone olmayan çok yakın
+                # konuşmayı AC enerji ve sıfır geçişiyle ikinci güvenli yol olarak
+                # kabul et.
+                model_voice = probability >= threshold and rms >= energy_threshold
+                strong_near_voice = (
+                    ac_rms
+                    >= max(
+                        self.barge_energy_floor * 3.0,
+                        self.noise_floor * 8.0,
+                    )
+                    and 0.01 <= zero_crossing_rate <= 0.55
+                )
+                voiced = model_voice or strong_near_voice
             else:
                 # AI sustuktan sonra müşteri hiçbir cihaz kazancında kilitli
-                # kalmasın. Silero konuşması veya belirgin yakın ses dinlemeyi
-                # başlatabilir; STT ayrıca halüsinasyon filtresinden geçer.
-                voiced = probability >= threshold or rms >= energy_threshold
+                # kalmasın. Silero konuşması düşük seviyede de dinlemeyi açar;
+                # yalnız enerjiye dayanan fallback ise hat gürültüsünün her kısa
+                # duraklamada yeni generation açmaması için belirgin yakın ses
+                # ister.
+                energy_only_threshold = max(
+                    energy_threshold,
+                    self.energy_floor * 4.0,
+                )
+                voiced = (
+                    probability >= threshold and rms >= energy_threshold
+                ) or rms >= energy_only_threshold
             if not self.speaking and not voiced and not assistant_speaking:
                 self.noise_floor = (self.noise_floor * 0.97) + (rms * 0.03)
             if not self.speaking:
@@ -105,6 +142,7 @@ class UtteranceSegmenter:
                 needed = self.barge_frames if assistant_speaking else self.start_frames
                 if self.voice_frames >= needed:
                     self.speaking = True
+                    self.speech_started = True
                     self.speech = bytearray().join(self.preroll)
                     self.silence_frames = 0
                     self.total_voice_frames = self.voice_frames
@@ -120,6 +158,7 @@ class UtteranceSegmenter:
                 if self.silence_frames >= self.end_frames or frames >= self.max_frames:
                     if self.total_voice_frames >= self.min_voice_frames:
                         completed.append(bytes(self.speech))
+                    self.speech_finished = True
                     self._reset_utterance()
         return barge, completed
 

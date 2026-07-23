@@ -67,11 +67,11 @@ class VoiceHangupTests(unittest.IsolatedAsyncioTestCase):
             opening_prompt=lambda: "Berberlerimiz: Mehmet ve Yusuf.",
         )
 
-        async def finish_locked_intro() -> None:
-            self.assertEqual(call.phase, call.LOCKED_INTRO)
+        async def finish_opening_greeting() -> None:
+            self.assertEqual(call.phase, call.INTERRUPTIBLE_DIALOG)
             call.phase = call.INTERRUPTIBLE_DIALOG
 
-        call._play_greeting = AsyncMock(side_effect=finish_locked_intro)
+        call._play_greeting = AsyncMock(side_effect=finish_opening_greeting)
         original_send = call._send_audio
 
         async def assert_opening_is_interruptible(chunk: bytes) -> None:
@@ -110,14 +110,14 @@ class VoiceHangupTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(asyncio.CancelledError):
             await task
 
-    async def test_ready_wav_greeting_stays_non_interruptible_until_complete(self) -> None:
+    async def test_ready_wav_greeting_is_interruptible_from_first_frame(self) -> None:
         writer = _Writer()
         call = AudioSocketCall(
             "00000000-0000-0000-0000-000000000001",
             asyncio.StreamReader(),
             writer,
         )
-        call.phase = call.LOCKED_INTRO
+        call.phase = call.INTERRUPTIBLE_DIALOG
 
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "greeting.wav"
@@ -131,7 +131,7 @@ class VoiceHangupTests(unittest.IsolatedAsyncioTestCase):
             original_send = call._send_audio
 
             async def assert_greeting_active(chunk: bytes) -> None:
-                self.assertEqual(call.phase, call.LOCKED_INTRO)
+                self.assertEqual(call.phase, call.INTERRUPTIBLE_DIALOG)
                 await original_send(chunk)
 
             call._send_audio = assert_greeting_active

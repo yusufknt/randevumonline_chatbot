@@ -35,3 +35,39 @@ class TurkishVoiceDateParserTests(unittest.TestCase):
             reference_date=date(2026, 7, 22),
         )
         self.assertEqual(value, date(2026, 7, 29))
+
+    def test_next_week_today_is_seven_days_later(self) -> None:
+        value, label = parse_target_date_tr(
+            "Haftaya bugün gelebilirim",
+            reference_date=date(2026, 7, 23),
+        )
+        self.assertEqual(value, date(2026, 7, 30))
+        self.assertEqual(label, "Haftaya bugün")
+
+    def test_numeric_days_later(self) -> None:
+        value, label = parse_target_date_tr(
+            "3 gün sonra",
+            reference_date=date(2026, 7, 23),
+        )
+        self.assertEqual(value, date(2026, 7, 26))
+        self.assertEqual(label, "3 gün sonra")
+
+    def test_spoken_days_later(self) -> None:
+        value, _ = parse_target_date_tr(
+            "Üç gün sonra için",
+            reference_date=date(2026, 7, 23),
+        )
+        self.assertEqual(value, date(2026, 7, 26))
+
+    def test_previous_relative_days_are_understood(self) -> None:
+        yesterday, _ = parse_target_date_tr(
+            "Bir gün önce",
+            reference_date=date(2026, 7, 23),
+        )
+        day_before_yesterday, label = parse_target_date_tr(
+            "Evveli gün",
+            reference_date=date(2026, 7, 23),
+        )
+        self.assertEqual(yesterday, date(2026, 7, 22))
+        self.assertEqual(day_before_yesterday, date(2026, 7, 21))
+        self.assertEqual(label, "Evvelsi gün")

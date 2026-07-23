@@ -82,6 +82,17 @@ class VoiceDialogStaffTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(_time_from_text("Yarın saat beş e olsun"), "17:00")
         self.assertEqual(_time_from_text("Saç, bir de.", allow_bare=True), "13:00")
         self.assertEqual(_time_from_text("Saç onişin.", allow_bare=True), "10:00")
+        self.assertEqual(
+            _time_from_text(
+                "Tamam, on altı otuz alayım ben.",
+                allow_bare=True,
+            ),
+            "16:30",
+        )
+        self.assertEqual(
+            _time_from_text("Dört buçuk olsun.", allow_bare=True),
+            "16:30",
+        )
         self.assertIsNone(_time_from_text("Bir randevu istiyorum"))
         self.assertIsNone(_time_from_text("Saat 28"))
         self.assertIsNone(_time_from_text("Saat 24"))
@@ -186,6 +197,22 @@ class VoiceDialogStaffTests(unittest.IsolatedAsyncioTestCase):
             self.dialog.normalize_stt_text("Akşam deşe."), "Akşam beşe."
         )
 
+    def test_service_barge_in_repairs_observed_kesisim_transcript(self) -> None:
+        self.dialog.services.append(
+            {"_id": "child", "name": "Çocuk Saç Kesimi"}
+        )
+        self.dialog.staff[0]["service_ids"].append("child")
+        self.dialog.staff_member = self.dialog.staff[0]
+
+        normalized = self.dialog.normalize_stt_text("Kesişim.")
+
+        self.assertEqual(normalized, "Saç Kesimi.")
+        self.assertTrue(self.dialog.accepts_low_confidence_transcript(normalized))
+        self.assertEqual(
+            self.dialog.sanitize_low_confidence_transcript(normalized),
+            "Saç Kesimi",
+        )
+
     def test_low_confidence_text_only_accepts_and_keeps_expected_entity(self) -> None:
         noisy = "Mehmet Beydar, Landauvar, Nexturus, Buginci."
         self.assertTrue(self.dialog.accepts_low_confidence_transcript(noisy))
@@ -254,10 +281,47 @@ class VoiceDialogStaffTests(unittest.IsolatedAsyncioTestCase):
         self.dialog.staff_member = self.dialog.staff[0]
         self.assertEqual(
             self.dialog.low_confidence_retry_prompt(),
-            "Hizmetlerimiz: Saç Kesimi. Hangisini istersiniz?",
+            "Hangi hizmeti istediğinizi tekrar söyler misiniz?",
         )
         self.assertNotIn(
             "net duyamadım", self.dialog.low_confidence_retry_prompt().lower()
+        )
+
+    def test_interruption_retry_does_not_repeat_the_stopped_list(self) -> None:
+        self.dialog.staff_member = self.dialog.staff[0]
+
+        prompt = self.dialog.interruption_retry_prompt()
+
+        self.assertEqual(
+            prompt,
+            "Sizi dinliyorum; hangi hizmeti istediğinizi söyler misiniz?",
+        )
+        self.assertNotIn("hizmetlerimiz", prompt.casefold())
+
+    def test_low_confidence_spoken_explicit_date_keeps_new_date(self) -> None:
+        self.dialog.staff_member = self.dialog.staff[0]
+        self.dialog.service = self.dialog.services[0]
+        self.dialog.target_date = date(2026, 7, 24)
+
+        normalized = self.dialog.normalize_stt_text("Otuz Ağustos.")
+
+        self.assertEqual(normalized, "30 Ağustos.")
+        self.assertTrue(self.dialog.accepts_low_confidence_transcript(normalized))
+        self.assertEqual(
+            self.dialog.sanitize_low_confidence_transcript(normalized),
+            "30 Ağustos",
+        )
+
+    def test_low_confidence_relative_date_is_actionable(self) -> None:
+        self.dialog.staff_member = self.dialog.staff[0]
+        self.dialog.service = self.dialog.services[0]
+
+        normalized = self.dialog.normalize_stt_text("Üç gün sonra.")
+
+        self.assertTrue(self.dialog.accepts_low_confidence_transcript(normalized))
+        self.assertEqual(
+            self.dialog.sanitize_low_confidence_transcript(normalized),
+            _date_spoken(date.today() + timedelta(days=3)),
         )
 
     async def test_staff_question_uses_barber_word_and_first_names(self) -> None:
@@ -276,6 +340,53 @@ class VoiceDialogStaffTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.dialog.staff_member["name"], "Emre Şahin")
         self.assertEqual(answer, "Hizmetlerimiz: Saç Kesimi. Hangisini istersiniz?")
 
+    async def test_no_staff_preference_selects_real_compatible_staff(self) -> None:
+        answer = await self.dialog.respond("Fark etmez, siz seçin.")
+
+        self.assertEqual(self.dialog.staff_member["name"], "Mehmet Kaya")
+        self.assertEqual(answer, "Hizmetlerimiz: Saç Kesimi. Hangisini istersiniz?")
+        self.dialog._interpret.assert_not_awaited()
+
+    async def test_no_staff_preference_keeps_previous_booking_details(self) -> None:
+        tomorrow = date.today() + timedelta(days=1)
+
+        await self.dialog.respond("Yarın saç kesimi saat beş")
+        answer = await self.dialog.respond("Kim müsaitse olur")
+
+        self.assertEqual(self.dialog.staff_member["name"], "Mehmet Kaya")
+        self.assertEqual(self.dialog.service["name"], "Saç Kesimi")
+        self.assertEqual(self.dialog.target_date, tomorrow)
+        self.assertEqual(self.dialog.target_time, "17:00")
+        self.assertIn("onaylıyor musunuz", answer)
+
+    async def test_earliest_available_time_advances_to_confirmation(self) -> None:
+        tz = ZoneInfo("Europe/Istanbul")
+        self.dialog.business["timezone"] = "Europe/Istanbul"
+        self.dialog.staff_member = self.dialog.staff[0]
+        self.dialog.service = {
+            **self.dialog.services[0],
+            "duration_minutes": 30,
+        }
+        self.dialog.target_date = date.today() + timedelta(days=1)
+        self.dialog._available_slots = AsyncMock(return_value=[
+            datetime.combine(
+                self.dialog.target_date,
+                datetime.min.time().replace(hour=11),
+                tzinfo=tz,
+            ),
+            datetime.combine(
+                self.dialog.target_date,
+                datetime.min.time().replace(hour=9),
+                tzinfo=tz,
+            ),
+        ])
+
+        answer = await self.dialog.respond("En erken saat olsun")
+
+        self.assertEqual(self.dialog.target_time, "09:00")
+        self.assertIn("saat 09:00", answer)
+        self.assertIn("onaylıyor musunuz", answer)
+
     async def test_spoken_staff_and_service_advance_without_finishing_lists(self) -> None:
         staff_answer = await self.dialog.respond("Yusuf")
         self.assertEqual(self.dialog.staff_member["name"], "Yusuf Demir")
@@ -287,6 +398,82 @@ class VoiceDialogStaffTests(unittest.IsolatedAsyncioTestCase):
         service_answer = await self.dialog.respond("Saç kesimi")
         self.assertEqual(self.dialog.service["name"], "Saç Kesimi")
         self.assertEqual(service_answer, "Hangi gün gelmek istersiniz?")
+
+    async def test_partial_hair_transcript_only_lists_matching_services(self) -> None:
+        self.dialog.services.extend([
+            {"_id": "combo", "name": "Saç + Sakal"},
+            {"_id": "child", "name": "Çocuk Saç Kesimi"},
+            {"_id": "beard", "name": "Sakal Tıraşı"},
+        ])
+        self.dialog.staff[0]["service_ids"].extend(["combo", "child", "beard"])
+        self.dialog.staff_member = self.dialog.staff[0]
+
+        answer = await self.dialog.respond("Saç")
+
+        self.assertIsNone(self.dialog.service)
+        self.assertIn("Saç Kesimi", answer)
+        self.assertIn("Saç + Sakal", answer)
+        self.assertIn("Çocuk Saç Kesimi", answer)
+        self.assertNotIn("Sakal Tıraşı", answer)
+        self.dialog._interpret.assert_not_awaited()
+
+    async def test_exact_hair_service_still_advances_normally(self) -> None:
+        self.dialog.services.extend([
+            {"_id": "combo", "name": "Saç + Sakal"},
+            {"_id": "child", "name": "Çocuk Saç Kesimi"},
+        ])
+        self.dialog.staff[0]["service_ids"].extend(["combo", "child"])
+        self.dialog.staff_member = self.dialog.staff[0]
+
+        answer = await self.dialog.respond("Saç kesimi")
+
+        self.assertEqual(self.dialog.service["name"], "Saç Kesimi")
+        self.assertEqual(answer, "Hangi gün gelmek istersiniz?")
+
+    def test_low_confidence_partial_hair_is_kept_for_clarification(self) -> None:
+        self.dialog.services.extend([
+            {"_id": "combo", "name": "Saç + Sakal"},
+            {"_id": "child", "name": "Çocuk Saç Kesimi"},
+        ])
+        self.dialog.staff[0]["service_ids"].extend(["combo", "child"])
+        self.dialog.staff_member = self.dialog.staff[0]
+
+        self.assertTrue(self.dialog.accepts_low_confidence_transcript("Saç"))
+        self.assertEqual(
+            self.dialog.sanitize_low_confidence_transcript("Saç"),
+            "saç",
+        )
+
+    async def test_unknown_spoken_staff_lists_only_real_staff(self) -> None:
+        answer = await self.dialog.respond("Fırat usta")
+
+        self.assertIsNone(self.dialog.staff_member)
+        self.assertIn("Fırat isimli bir ustamız bulunmuyor", answer)
+        for first_name in ("Mehmet", "Yusuf", "Ahmet", "Emre"):
+            self.assertIn(first_name, answer)
+        self.dialog._interpret.assert_not_awaited()
+
+    def test_low_confidence_unknown_staff_reaches_catalog_clarification(self) -> None:
+        self.assertTrue(
+            self.dialog.accepts_low_confidence_transcript("Fırat usta")
+        )
+        self.assertEqual(
+            self.dialog.sanitize_low_confidence_transcript("Fırat usta"),
+            "Fırat usta",
+        )
+
+    async def test_unknown_staff_correction_cannot_keep_previous_staff(self) -> None:
+        self.dialog.staff_member = self.dialog.staff[0]
+        self.dialog.service = self.dialog.services[0]
+        self.dialog.target_date = date.today() + timedelta(days=1)
+        self.dialog.target_time = "17:00"
+
+        answer = await self.dialog.respond("Fırat ustadan olsun")
+
+        self.assertIsNone(self.dialog.staff_member)
+        self.assertEqual(self.dialog.service["name"], "Saç Kesimi")
+        self.assertIn("Ustalarımız", answer)
+        self.assertNotIn("onaylıyor musunuz", answer)
 
     async def test_rejected_confirmation_applies_time_in_same_sentence(self) -> None:
         self.dialog.staff_member = self.dialog.staff[-1]
@@ -620,14 +807,66 @@ class VoiceDialogStaffTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.dialog.pending.action, "post_booking")
         self.assertIn("Başka bir isteğiniz", answer)
 
-    async def test_service_step_greeting_cannot_create_an_unrelated_llm_answer(self) -> None:
+    async def test_service_step_uses_grounded_natural_llm_answer(self) -> None:
         self.dialog.staff_member = self.dialog.staff[0]
         self.dialog._interpret = AsyncMock(
-            return_value={"intent": "other", "answer": "Uydurma bir cevap"}
+            return_value={
+                "intent": "other",
+                "answer": (
+                    "Merhaba, elbette yardımcı olayım; Mehmet Bey için hangi "
+                    "hizmeti düşünüyorsunuz?"
+                ),
+            }
         )
         answer = await self.dialog.respond("Merhaba")
-        self.assertIn("Hangisini istersiniz", answer)
-        self.dialog._interpret.assert_not_awaited()
+        self.assertIn("Merhaba", answer)
+        self.assertIn("hangi hizmeti", answer)
+        self.assertEqual(self.dialog.staff_member["name"], "Mehmet Kaya")
+        self.dialog._interpret.assert_awaited_once()
+
+    async def test_unexpected_customer_reaction_is_not_forced_into_booking(self) -> None:
+        self.dialog._interpret = AsyncMock(
+            return_value={
+                "intent": "other",
+                "answer": (
+                    "Sizi anlıyorum, içinize sinen bir seçim yapmanız önemli; "
+                    "isterseniz beklentinizi söyleyin, birlikte netleştirelim."
+                ),
+            }
+        )
+
+        answer = await self.dialog.respond("Mehmet iyi kesiyor mu, emin olamadım")
+
+        self.assertIn("Sizi anlıyorum", answer)
+        self.assertIsNone(self.dialog.staff_member)
+        self.assertIsNone(self.dialog.pending)
+        self.dialog._interpret.assert_awaited_once()
+
+    async def test_question_containing_booking_word_is_interpreted_as_a_question(self) -> None:
+        self.dialog._interpret = AsyncMock(
+            return_value={
+                "intent": "other",
+                "answer": "Hayır, randevu oluşturmak için ayrıca ücret almıyoruz.",
+            }
+        )
+
+        answer = await self.dialog.respond(
+            "Randevu almak için ayrıca ücret alıyor musunuz?"
+        )
+
+        self.assertIn("ayrıca ücret almıyoruz", answer)
+        self.assertIsNone(self.dialog.pending)
+        self.dialog._interpret.assert_awaited_once()
+
+    async def test_other_without_llm_answer_returns_current_context_question(self) -> None:
+        self.dialog.staff_member = self.dialog.staff[0]
+        self.dialog._interpret = AsyncMock(return_value={})
+
+        answer = await self.dialog.respond("Biraz düşüneyim")
+
+        self.assertEqual(
+            answer, "Hizmetlerimiz: Saç Kesimi. Hangisini istersiniz?"
+        )
 
     def test_llm_cannot_invent_date_or_time_without_transcript_evidence(self) -> None:
         self.dialog.staff_member = self.dialog.staff[0]
@@ -701,18 +940,137 @@ class VoiceDialogStaffTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(cached_slots, slots)
         query.assert_awaited_once()
+        self.assertEqual(query.await_args.kwargs["step_minutes"], 45)
 
-    def test_contiguous_slots_are_spoken_as_one_range(self) -> None:
+    def test_contiguous_slots_only_describe_real_start_times(self) -> None:
         tz = ZoneInfo("Europe/Istanbul")
         slots = [
             datetime(2026, 7, 22, hour, minute, tzinfo=tz).astimezone(timezone.utc)
             for hour, minute in (
-                (9, 0), (9, 15), (9, 30), (9, 45), (10, 0), (10, 15),
-                (10, 30), (10, 45), (11, 0), (11, 15), (11, 30),
+                (11, 0), (11, 45), (12, 30), (13, 15),
             )
         ]
 
         ranges = _slot_ranges(slots, tz, duration_minutes=30)
 
         self.assertEqual(len(ranges), 1)
-        self.assertEqual(_format_slot_ranges(ranges), "9 ile 12 arası")
+        self.assertEqual(
+            _format_slot_ranges(ranges),
+            "saat 11 ile 13:15 arası",
+        )
+        self.assertEqual(ranges[0][0].strftime("%H:%M"), "11:00")
+        self.assertEqual(ranges[0][1].strftime("%H:%M"), "13:15")
+
+    def test_missing_45_minute_slot_splits_spoken_blocks(self) -> None:
+        tz = ZoneInfo("Europe/Istanbul")
+        slots = [
+            datetime(2026, 7, 22, hour, minute, tzinfo=tz).astimezone(timezone.utc)
+            for hour, minute in ((11, 0), (11, 45), (13, 15))
+        ]
+
+        ranges = _slot_ranges(slots, tz, duration_minutes=30)
+
+        self.assertEqual(len(ranges), 2)
+        self.assertEqual(
+            _format_slot_ranges(ranges),
+            "saat 11 ile 11:45 arası ve saat 13:15",
+        )
+
+    def test_single_start_slot_does_not_speak_service_end_time(self) -> None:
+        tz = ZoneInfo("Europe/Istanbul")
+        slots = [
+            datetime(2026, 7, 22, 11, 45, tzinfo=tz).astimezone(timezone.utc)
+        ]
+
+        ranges = _slot_ranges(slots, tz, duration_minutes=60)
+
+        self.assertEqual(_format_slot_ranges(ranges), "saat 11:45")
+
+    async def test_availability_answer_does_not_offer_unbookable_end_time(self) -> None:
+        tz = ZoneInfo("Europe/Istanbul")
+        self.dialog.business["timezone"] = "Europe/Istanbul"
+        self.dialog.staff_member = self.dialog.staff[0]
+        self.dialog.service = {
+            **self.dialog.services[0],
+            "duration_minutes": 60,
+        }
+        self.dialog.target_date = date.today() + timedelta(days=1)
+        self.dialog._available_slots = AsyncMock(return_value=[
+            datetime.combine(
+                self.dialog.target_date,
+                datetime.min.time().replace(hour=11, minute=45),
+                tzinfo=tz,
+            ),
+        ])
+
+        answer = await self.dialog._availability_answer()
+
+        self.assertIn("uygun alınabilecek saatler: saat 11:45", answer)
+        self.assertNotIn("12:45", answer)
+
+    async def test_spoken_sixteen_thirty_advances_to_confirmation(self) -> None:
+        self.dialog.staff_member = self.dialog.staff[0]
+        self.dialog.service = self.dialog.services[0]
+        self.dialog.target_date = date.today() + timedelta(days=1)
+
+        answer = await self.dialog.respond(
+            "Tamam, on altı otuz alayım ben."
+        )
+
+        self.assertEqual(self.dialog.target_time, "16:30")
+        self.assertIn("saat 16:30", answer)
+        self.assertIn("onaylıyor musunuz", answer)
+
+    async def test_afternoon_request_only_speaks_afternoon_start_slots(self) -> None:
+        tz = ZoneInfo("Europe/Istanbul")
+        self.dialog.business["timezone"] = "Europe/Istanbul"
+        self.dialog.staff_member = self.dialog.staff[0]
+        self.dialog.service = {
+            **self.dialog.services[0],
+            "duration_minutes": 30,
+        }
+        self.dialog.target_date = date.today() + timedelta(days=1)
+        self.dialog._available_slots = AsyncMock(return_value=[
+            datetime.combine(
+                self.dialog.target_date,
+                datetime.min.time().replace(hour=10),
+                tzinfo=tz,
+            ),
+            datetime.combine(
+                self.dialog.target_date,
+                datetime.min.time().replace(hour=12),
+                tzinfo=tz,
+            ),
+            datetime.combine(
+                self.dialog.target_date,
+                datetime.min.time().replace(hour=14, minute=30),
+                tzinfo=tz,
+            ),
+            datetime.combine(
+                self.dialog.target_date,
+                datetime.min.time().replace(hour=18),
+                tzinfo=tz,
+            ),
+        ])
+
+        answer = await self.dialog.respond("Öğleden sonra olsun")
+
+        self.assertEqual(self.dialog.time_preference, "afternoon")
+        self.assertIn("öğleden sonra", answer)
+        self.assertIn("12", answer)
+        self.assertIn("14:30", answer)
+        self.assertNotIn("10", answer)
+        self.assertNotIn("18", answer)
+
+    def test_low_confidence_afternoon_preference_is_preserved(self) -> None:
+        self.dialog.staff_member = self.dialog.staff[0]
+        self.dialog.service = self.dialog.services[0]
+        self.dialog.target_date = date.today() + timedelta(days=1)
+
+        self.assertTrue(
+            self.dialog.accepts_low_confidence_transcript("Öğleden sonra")
+        )
+        self.assertEqual(
+            self.dialog.sanitize_low_confidence_transcript("Öğleden sonra"),
+            "öğleden sonra",
+        )
